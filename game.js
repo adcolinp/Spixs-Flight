@@ -19,18 +19,21 @@ const NUM_ZONES      = 16;     // base count — declines with year
 const ZONE_R         = 3.23;   // Caraibeira zone radius
 const ZONE_TRUNK_R   = 0.45;   // collideable trunk radius (world units)
 const NUM_TRAPS      = 22;
-const NUM_SAPLINGS   = 36;     // decorative trees — also collideable
-const SAPLING_TRUNK_R = 0.22;  // sapling trunk collision radius
+const NUM_SAPLINGS   = 90;     // 250% of original 36 — two types filling the forest
 const WORLD_SPAN     = 27;     // 50% larger than original 18 — fits 3600×2700 bounds
 
 // Enemies
-const NUM_POACHERS       = 5;
+const NUM_POACHERS       = 10;
 const POACHER_PATROL_R   = 1.5;   // world units ≈ 100 screen px
 const POACHER_DETECT_R   = 3.0;   // chase trigger ≈ 200 px
 const POACHER_RETURN_R   = 4.5;   // return trigger ≈ 300 px
 const POACHER_SPEED      = 125 / 64; // world units/sec ≈ 125 px/s
 const POACHER_PATROL_SPD = 0.5;   // rad/sec for patrol orbit
-const REAPER_SPEED       = 0.625; // world units/sec ≈ 40 px/s
+const REAPER_SPEED       = 0.9375; // 50% faster than original 0.625
+const NET_SPEED  = 4.5;  // world units/sec
+const NET_CD     = 3.0;  // seconds between shots per poacher
+const NET_RANGE  = 4.0;  // world units before net fades
+const NET_HIT_R  = 0.30; // capture radius
 
 // Scoring / Spirit Anchor
 const ZONE_HOLD_TIME   = 5.0;   // seconds to fill the Spirit Meter
@@ -70,9 +73,10 @@ class GameScene extends Phaser.Scene {
     );
 
     // Graphics layers (depth order matters)
+    this.grassGfx  = this.add.graphics().setDepth(0.5);
     this.zoneGfx   = this.add.graphics().setDepth(1);
     this.portalGfx = this.add.graphics().setDepth(1.5);
-    this.trapGfx   = this.add.graphics().setDepth(2);
+    this.trapGfx   = this.add.graphics().setDepth(0.7);
     this.trailGfx  = this.add.graphics().setDepth(3);
     this.shadowGfx = this.add.graphics().setDepth(4);
     this.mateGfx   = this.add.graphics().setDepth(5);
@@ -193,6 +197,7 @@ class GameScene extends Phaser.Scene {
     this._updateAncestralCall(dt);
 
     this._placeTiles();
+    this._drawGrass();
     this._drawZones();
     this._drawPortal();
     this._drawTraps();
@@ -235,7 +240,7 @@ class GameScene extends Phaser.Scene {
     // Saplings also occlude the player
     if (pd > 1) {
       for (const sp of this.saplings) {
-        if (Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < sp.sc * 3.5 &&
+        if (Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < sp.trunkR * 4.5 &&
             pIsoY < sp.wx + sp.wy) {
           pd = 0.5; sd = 0.4; td = 0.3; break;
         }
@@ -340,7 +345,7 @@ class GameScene extends Phaser.Scene {
     for (const sp of this.saplings) {
       const dx = this.wx - sp.wx, dy = this.wy - sp.wy;
       const dist = Math.hypot(dx, dy);
-      const minD = SAPLING_TRUNK_R + PLAYER_R;
+      const minD = sp.trunkR + PLAYER_R;
       if (dist < minD && dist > 0.001) {
         const nx = dx / dist, ny = dy / dist;
         this.wx = sp.wx + nx * minD;
@@ -425,7 +430,12 @@ class GameScene extends Phaser.Scene {
       }
     }
     if (Math.hypot(this.wx - this.reaper.wx, this.wy - this.reaper.wy) < 0.85) {
-      this._triggerDeath();
+      this._triggerDeath(); return;
+    }
+    for (let i = this.nets.length - 1; i >= 0; i--) {
+      if (Math.hypot(this.wx - this.nets[i].wx, this.wy - this.nets[i].wy) < NET_HIT_R) {
+        this._triggerDeath(); return;
+      }
     }
   }
 
@@ -518,6 +528,29 @@ class GameScene extends Phaser.Scene {
       }
     }
 
+    // ── Net shooting ──
+    for (const p of this.poachers) {
+      if (p.netCD > 0) p.netCD -= dt;
+      if (p.state === 'chase' && p.netCD <= 0) {
+        const dist = Math.hypot(this.wx - p.wx, this.wy - p.wy);
+        if (dist < POACHER_DETECT_R && dist > 0.01) {
+          const nx = (this.wx - p.wx) / dist;
+          const ny = (this.wy - p.wy) / dist;
+          this.nets.push({ wx: p.wx, wy: p.wy, vx: nx * NET_SPEED, vy: ny * NET_SPEED, dist: 0 });
+          p.netCD = NET_CD;
+        }
+      }
+    }
+
+    // ── Update nets ──
+    for (let i = this.nets.length - 1; i >= 0; i--) {
+      const n = this.nets[i];
+      n.wx += n.vx * dt;
+      n.wy += n.vy * dt;
+      n.dist += Math.hypot(n.vx * dt, n.vy * dt);
+      if (n.dist > NET_RANGE) this.nets.splice(i, 1);
+    }
+
     // ── Reaper ──
     if (!inSanctuary) {
       const dx = this.wx - this.reaper.wx, dy = this.wy - this.reaper.wy;
@@ -586,6 +619,31 @@ class GameScene extends Phaser.Scene {
         this.enemyGfx.strokePath();
       }
     }
+
+    // ── Nets ──
+    for (const n of this.nets) {
+      const s = toScreen(n.wx, n.wy);
+      if (Math.abs(s.x - cam.x) > 800 || Math.abs(s.y - cam.y) > 500) continue;
+      const alpha = 1.0 - n.dist / NET_RANGE;
+      const hw = 12, hh = 7;
+      // Outer diamond
+      this.enemyGfx.lineStyle(1.5, 0xddddaa, alpha);
+      this.enemyGfx.beginPath();
+      this.enemyGfx.moveTo(s.x,      s.y - hh);
+      this.enemyGfx.lineTo(s.x + hw, s.y);
+      this.enemyGfx.lineTo(s.x,      s.y + hh);
+      this.enemyGfx.lineTo(s.x - hw, s.y);
+      this.enemyGfx.closePath();
+      this.enemyGfx.strokePath();
+      // Net cross-lines
+      this.enemyGfx.lineStyle(1, 0xbbbb88, alpha * 0.75);
+      this.enemyGfx.beginPath();
+      this.enemyGfx.moveTo(s.x - hw * 0.6, s.y - hh * 0.5);
+      this.enemyGfx.lineTo(s.x + hw * 0.6, s.y + hh * 0.5);
+      this.enemyGfx.moveTo(s.x + hw * 0.6, s.y - hh * 0.5);
+      this.enemyGfx.lineTo(s.x - hw * 0.6, s.y + hh * 0.5);
+      this.enemyGfx.strokePath();
+    }
   }
 
   // ── _placeTiles ──────────────────────────────────────────────────────────────
@@ -599,6 +657,20 @@ class GameScene extends Phaser.Scene {
         tile.x = s.x; tile.y = s.y;
         tile.setTexture((tx + ty) % 2 === 0 ? 't0' : 't1');
       }
+    }
+  }
+
+  // ── _drawGrass ───────────────────────────────────────────────────────────────
+  _drawGrass() {
+    this.grassGfx.clear();
+    const cam = toScreen(this.wx, this.wy);
+    for (const gp of this.grassPatches) {
+      const s = toScreen(gp.wx, gp.wy);
+      if (Math.abs(s.x - cam.x) > 900 || Math.abs(s.y - cam.y) > 600) continue;
+      const rw = gp.size * 64;
+      const rh = gp.size * 32;
+      this.grassGfx.fillStyle(gp.color, gp.alpha);
+      this.grassGfx.fillEllipse(s.x, s.y, rw, rh);
     }
   }
 
@@ -626,16 +698,20 @@ class GameScene extends Phaser.Scene {
 
     for (const { kind, obj, s } of list) {
       if (kind === 'sapling') {
-        const sc = obj.sc;
-        // Trunk (2× original dimensions)
-        g.fillStyle(0x3a1e08, 0.88);
-        g.fillRect(s.x - 4, s.y - sc * 92, 8, sc * 88);
+        // Type 0 = 90% of Caraibeira, Type 1 = 80% of Caraibeira
+        const f = obj.type === 0 ? 0.9 : 0.8;
+        // Trunk
+        g.fillStyle(0x3a1e08, 1);
+        g.fillRect(s.x - Math.round(10 * f), s.y - Math.round(136 * f), Math.round(20 * f), Math.round(132 * f));
         // Lower canopy
-        g.fillStyle(0x1e6420, 0.82);
-        g.fillEllipse(s.x, s.y - sc * 64, sc * 104, sc * 52);
-        // Upper canopy
-        g.fillStyle(0x2e8830, 0.88);
-        g.fillEllipse(s.x, s.y - sc * 100, sc * 68, sc * 34);
+        g.fillStyle(0x1a6622, 0.94);
+        g.fillEllipse(s.x, s.y - Math.round(144 * f), Math.round(188 * f), Math.round(94 * f));
+        // Mid canopy
+        g.fillStyle(0x2d8834, 0.97);
+        g.fillEllipse(s.x, s.y - Math.round(200 * f), Math.round(140 * f), Math.round(70 * f));
+        // Top canopy
+        g.fillStyle(0x56bb44, 1.0);
+        g.fillEllipse(s.x, s.y - Math.round(244 * f), Math.round(88 * f), Math.round(44 * f));
         continue;
       }
 
@@ -907,18 +983,34 @@ class GameScene extends Phaser.Scene {
       this.zones.push({ wx, wy, radius: ZONE_R, phase: Math.random() * Math.PI * 2, bloomed: false });
     }
 
-    // Saplings — smaller collideable trees filling out the forest
+    // Saplings — two sizes of obstacle trees filling out the forest
+    // Type 0 = 90% of Caraibeira size, Type 1 = 80% of Caraibeira size
     this.saplings = [];
     let tries = 0;
-    while (this.saplings.length < NUM_SAPLINGS && tries++ < 4000) {
+    while (this.saplings.length < NUM_SAPLINGS && tries++ < 6000) {
       const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
       if (!inBounds(wx, wy, 40, 40)) continue;
       if (Math.hypot(wx, wy) < 5) continue;
       if (this.zones.some(z => Math.hypot(wx - z.wx, wy - z.wy) < z.radius + 1.5)) continue;
-      if (this.saplings.some(s => Math.hypot(wx - s.wx, wy - s.wy) < 2.5)) continue;
-      const sc = 0.45 + Math.random() * 0.45;
-      this.saplings.push({ wx, wy, sc, phase: Math.random() * Math.PI * 2 });
+      if (this.saplings.some(s => Math.hypot(wx - s.wx, wy - s.wy) < 2.0)) continue;
+      const type   = Math.random() < 0.5 ? 0 : 1;
+      const trunkR = type === 0 ? 0.40 : 0.36;
+      this.saplings.push({ wx, wy, type, trunkR, phase: Math.random() * Math.PI * 2 });
+    }
+
+    // Grass patches — green spots scattered over the ochre ground
+    this.grassPatches = [];
+    tries = 0;
+    const grassColors = [0x4a8c2a, 0x5ab030, 0x3d7a1e, 0x66b844, 0x438c28];
+    while (this.grassPatches.length < 200 && tries++ < 3000) {
+      const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      if (!inBounds(wx, wy, 80, 80)) continue;
+      const size  = 0.5 + Math.random() * 1.0;
+      const color = grassColors[Math.floor(Math.random() * grassColors.length)];
+      const alpha = 0.22 + Math.random() * 0.22;
+      this.grassPatches.push({ wx, wy, size, color, alpha });
     }
 
     // Traps — kept clear of all trees
@@ -947,6 +1039,7 @@ class GameScene extends Phaser.Scene {
         wx, wy, wx0: wx, wy0: wy,
         state: 'patrol',
         patrolAngle: Math.random() * Math.PI * 2,
+        netCD: Math.random() * NET_CD,  // stagger initial cooldowns
       });
     }
 
@@ -957,6 +1050,9 @@ class GameScene extends Phaser.Scene {
       ry = (Math.random() - 0.5) * WORLD_SPAN * 2;
     } while ((Math.hypot(rx, ry) < 18 || !inBounds(rx, ry, 60, 60)) && rtries++ < 400);
     this.reaper = { wx: rx, wy: ry, alpha: 0.2 };
+
+    // Poacher nets — fired projectiles
+    this.nets = [];
   }
 
   // ── _updateScore ─────────────────────────────────────────────────────────────
