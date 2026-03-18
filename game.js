@@ -4,10 +4,10 @@ const TILE_H = 64;
 const RENDER_R = 12;   // tile render radius — large enough for fog to cover the edge seam
 
 // Movement
-const SPEED       = 6.4;  // reduced 20%
+const SPEED       = 6.4;
 const SPEED_BOOST = 1.45;  // multiplier while Mate is active
-const ACCEL       = 42;
-const DRAG        = 34;
+const ACCEL       = 32;    // softer ramp-up for bird-like feel
+const DRAG        = 7;     // low drag → long glide, not a helicopter stop
 
 // Dash
 const DASH_V   = 30;
@@ -15,15 +15,16 @@ const DASH_DUR = 0.16;
 const DASH_CD  = 0.70;
 
 // World generation
-const NUM_ZONES  = 4;
-const ZONE_R     = 3.8;   // Caraibeira zone radius in tile units
-const NUM_TRAPS  = 10;
-const WORLD_SPAN = 18;    // half-size of the world (tiles) — fits 2400×1800 bounds
-const NUM_ROCKS  = 18;    // collideable boulder obstacles
-const ROCK_R     = 1.0;   // obstacle collision radius (world units)
+const NUM_ZONES      = 16;     // base count — declines with year
+const ZONE_R         = 3.23;   // Caraibeira zone radius
+const ZONE_TRUNK_R   = 0.45;   // collideable trunk radius (world units)
+const NUM_TRAPS      = 22;
+const NUM_SAPLINGS   = 36;     // decorative trees — also collideable
+const SAPLING_TRUNK_R = 0.22;  // sapling trunk collision radius
+const WORLD_SPAN     = 27;     // 50% larger than original 18 — fits 3600×2700 bounds
 
 // Enemies
-const NUM_POACHERS       = 3;
+const NUM_POACHERS       = 5;
 const POACHER_PATROL_R   = 1.5;   // world units ≈ 100 screen px
 const POACHER_DETECT_R   = 3.0;   // chase trigger ≈ 200 px
 const POACHER_RETURN_R   = 4.5;   // return trigger ≈ 300 px
@@ -50,6 +51,12 @@ function toScreen(wx, wy) {
 class GameScene extends Phaser.Scene {
   constructor() { super({ key: 'Game' }); }
 
+  // ── init ────────────────────────────────────────────────────────────────────
+  init(data) {
+    this.currentYear  = (data && data.year) ? data.year : 1987;
+    this.playerHealth = 3; // placeholder — full bar until health system is built
+  }
+
   // ── create ──────────────────────────────────────────────────────────────────
   create() {
     // Ochre Caatinga floor tiles
@@ -63,15 +70,15 @@ class GameScene extends Phaser.Scene {
     );
 
     // Graphics layers (depth order matters)
-    this.zoneGfx     = this.add.graphics().setDepth(1);
-    this.portalGfx   = this.add.graphics().setDepth(1.5);
-    this.trapGfx     = this.add.graphics().setDepth(2);
-    this.obstacleGfx = this.add.graphics().setDepth(2.5);
-    this.trailGfx    = this.add.graphics().setDepth(3);
+    this.zoneGfx   = this.add.graphics().setDepth(1);
+    this.portalGfx = this.add.graphics().setDepth(1.5);
+    this.trapGfx   = this.add.graphics().setDepth(2);
+    this.trailGfx  = this.add.graphics().setDepth(3);
     this.shadowGfx = this.add.graphics().setDepth(4);
     this.mateGfx   = this.add.graphics().setDepth(5);
     this.enemyGfx  = this.add.graphics().setDepth(5.5);
     this.playerGfx = this.add.graphics().setDepth(6);
+    this.revealGfx = this.add.graphics().setDepth(55); // above fog (50), below HUD (100)
     this.hudGfx    = this.add.graphics().setScrollFactor(0).setDepth(60);
 
     // ── Player ──────────────────────────────────────────────────────────────
@@ -125,23 +132,50 @@ class GameScene extends Phaser.Scene {
     this.spiritSense = false;
 
     // ── Input ───────────────────────────────────────────────────────────────
-    this.keys      = this.input.keyboard.addKeys('W,A,S,D,SPACE');
+    this.keys      = this.input.keyboard.addKeys('W,A,S,D,SPACE,E');
     this.prevSpace = false;
+
+    // ── Ancestral Call ───────────────────────────────────────────────────────
+    this.ancestralCD      = 0;    // cooldown remaining (seconds)
+    this.ancestralReveal  = 0;    // remaining duration of zone reveal (seconds)
+    this.ancestralRipples = [];   // array of expanding ring objects
+    this.prevE            = false;
 
     // Zone hold countdown (hidden — Spirit Meter arc replaces the number)
     this.timerText = this.add.text(0, 0, '', {
-      fontFamily: 'Georgia, serif', fontSize: '28px', color: '#aaffaa',
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '28px', color: '#aaffaa',
       stroke: '#1a3318', strokeThickness: 4,
-    }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(61).setVisible(false);
+    }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(100).setVisible(false);
 
-    // Trees Saved counter — top-left HUD
-    this.spiritCountText = this.add.text(16, 14, '', {
-      fontFamily: 'Georgia, serif', fontSize: '17px', color: '#ffffff',
-      stroke: '#1a1a1a', strokeThickness: 3,
-    }).setOrigin(0, 0).setScrollFactor(0).setDepth(61);
+    // ── Persistent HUD — fixed to camera, always above Fog of War (depth 50) ──
+    const HW = this.scale.width;
+
+    // Trees Saved — top-left corner
+    this.treesSavedText = this.add.text(20, 16, '', {
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '18px', color: '#ffffff',
+      stroke: '#000000', strokeThickness: 3,
+    }).setOrigin(0, 0).setScrollFactor(0).setDepth(100);
+
+    // Current Year — top-right corner
+    this.yearText = this.add.text(HW - 20, 16, '', {
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '18px', color: '#ffffff',
+      stroke: '#000000', strokeThickness: 3,
+    }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
+
+    // Health label (bar is drawn in _drawHUD via hudGfx)
+    this.healthLabel = this.add.text(20, 44, 'Health', {
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '12px', color: '#cccccc',
+      stroke: '#000000', strokeThickness: 2,
+    }).setOrigin(0, 0).setScrollFactor(0).setDepth(100);
+
+    // Ancestral Call cooldown label
+    this.ancestralText = this.add.text(20, 82, '', {
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '12px', color: '#88ccff',
+      stroke: '#000000', strokeThickness: 2,
+    }).setOrigin(0, 0).setScrollFactor(0).setDepth(100);
 
     this.cameras.main.setBackgroundColor('#b0a890'); // warm gray — blends with fog edge
-    this.cameras.main.setBounds(-1200, -900, 2400, 1800);
+    this.cameras.main.setBounds(-1800, -1350, 3600, 2700); // 50% larger map
     this._makeFog();
   }
 
@@ -156,47 +190,54 @@ class GameScene extends Phaser.Scene {
     this._checkTraps();
     this._updateParticles(dt);
     this._updateScore(dt);
+    this._updateAncestralCall(dt);
 
     this._placeTiles();
     this._drawZones();
     this._drawPortal();
     this._drawTraps();
-    this._drawObstacles();
     this._drawEnemies();
     this._drawTrail();
     this._drawShadow();
     this._drawMate();
     this._drawPlayer();
+    this._drawAncestralCall();
     this._drawHUD();
 
     const s = toScreen(this.wx, this.wy);
     this.cameras.main.centerOn(s.x, s.y);
 
-    // Tree depth: go behind zone when entity is north of it (smaller iso-Y)
+    // Tree depth: go behind a tree when entity is north of its trunk base
     let pd = 6, sd = 4, td = 3, ed = 5.5;
     const pIsoY = this.wx + this.wy;
 
     for (const z of this.zones) {
       const zIsoY = z.wx + z.wy;
-      // Player
       if (pd > 1 &&
-          Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius * 2.0 &&
+          Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius * 2.5 &&
           pIsoY < zIsoY) {
         pd = 0.5; sd = 0.4; td = 0.3;
       }
-      // Reaper
       if (ed > 1 &&
           Math.hypot(this.reaper.wx - z.wx, this.reaper.wy - z.wy) < z.radius * 2.0 &&
           this.reaper.wx + this.reaper.wy < zIsoY) {
         ed = 0.6;
       }
-      // Any Poacher
       if (ed > 1) {
         for (const p of this.poachers) {
           if (Math.hypot(p.wx - z.wx, p.wy - z.wy) < z.radius * 2.0 &&
               p.wx + p.wy < zIsoY) {
             ed = 0.6; break;
           }
+        }
+      }
+    }
+    // Saplings also occlude the player
+    if (pd > 1) {
+      for (const sp of this.saplings) {
+        if (Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < sp.sc * 3.5 &&
+            pIsoY < sp.wx + sp.wy) {
+          pd = 0.5; sd = 0.4; td = 0.3; break;
         }
       }
     }
@@ -272,26 +313,38 @@ class GameScene extends Phaser.Scene {
     this.wx += this.vx * dt;
     this.wy += this.vy * dt;
 
-    // Clamp to world bounds (2400×1800 screen pixels centred on origin)
+    // Clamp to world bounds (3600×2700 screen pixels centred on origin)
     const ps = toScreen(this.wx, this.wy);
-    const csx = Phaser.Math.Clamp(ps.x, -1200, 1200);
-    const csy = Phaser.Math.Clamp(ps.y, -900, 900);
+    const csx = Phaser.Math.Clamp(ps.x, -1800, 1800);
+    const csy = Phaser.Math.Clamp(ps.y, -1350, 1350);
     if (csx !== ps.x || csy !== ps.y) {
       this.wx = csx / 128 + csy / 64;
       this.wy = csy / 64  - csx / 128;
       this.vx = 0; this.vy = 0;
     }
 
-    // Obstacle collision — push player out and slide velocity along surface
-    for (const r of this.rocks) {
-      const dx   = this.wx - r.wx;
-      const dy   = this.wy - r.wy;
+    // Tree trunk collision — push player out and slide velocity along surface
+    const PLAYER_R = 0.35;
+    for (const z of this.zones) {
+      const dx = this.wx - z.wx, dy = this.wy - z.wy;
       const dist = Math.hypot(dx, dy);
-      const minD = r.radius + 0.35; // 0.35 ≈ player body radius
+      const minD = ZONE_TRUNK_R + PLAYER_R;
       if (dist < minD && dist > 0.001) {
         const nx = dx / dist, ny = dy / dist;
-        this.wx = r.wx + nx * minD;
-        this.wy = r.wy + ny * minD;
+        this.wx = z.wx + nx * minD;
+        this.wy = z.wy + ny * minD;
+        const dot = this.vx * nx + this.vy * ny;
+        if (dot < 0) { this.vx -= dot * nx; this.vy -= dot * ny; }
+      }
+    }
+    for (const sp of this.saplings) {
+      const dx = this.wx - sp.wx, dy = this.wy - sp.wy;
+      const dist = Math.hypot(dx, dy);
+      const minD = SAPLING_TRUNK_R + PLAYER_R;
+      if (dist < minD && dist > 0.001) {
+        const nx = dx / dist, ny = dy / dist;
+        this.wx = sp.wx + nx * minD;
+        this.wy = sp.wy + ny * minD;
         const dot = this.vx * nx + this.vy * ny;
         if (dot < 0) { this.vx -= dot * nx; this.vy -= dot * ny; }
       }
@@ -362,7 +415,7 @@ class GameScene extends Phaser.Scene {
   // ── _checkTraps ──────────────────────────────────────────────────────────────
   _checkTraps() {
     for (const t of this.traps) {
-      if (Math.hypot(this.wx - t.wx, this.wy - t.wy) < 0.75) {
+      if (Math.hypot(this.wx - t.wx, this.wy - t.wy) < 0.42) {
         this._triggerDeath(); return;
       }
     }
@@ -454,6 +507,8 @@ class GameScene extends Phaser.Scene {
           p.wx += (dx / dist) * step;
           p.wy += (dy / dist) * step;
         } else {
+          // Sync angle to current offset before entering patrol to prevent position jump
+          p.patrolAngle = Math.atan2(p.wy - p.wy0, p.wx - p.wx0);
           p.state = 'patrol';
         }
       } else { // patrol
@@ -533,72 +588,6 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  // ── _drawObstacles ───────────────────────────────────────────────────────────
-  _drawObstacles() {
-    this.obstacleGfx.clear();
-    const cam = toScreen(this.wx, this.wy);
-
-    // Sort back-to-front so rocks overlap correctly
-    const visible = this.rocks
-      .map(r => ({ r, s: toScreen(r.wx, r.wy), isoY: r.wx + r.wy }))
-      .filter(({ s }) => Math.abs(s.x - cam.x) < 800 && Math.abs(s.y - cam.y) < 500)
-      .sort((a, b) => a.isoY - b.isoY);
-
-    for (const { r, s } of visible) {
-      const hw = r.radius * 60;   // screen half-width (matches iso tile ratio)
-      const hh = r.radius * 30;   // screen half-height
-      const ht = r.radius * 36;   // rock visual height (above ground plane)
-
-      // Right face (darkest — in shadow)
-      this.obstacleGfx.fillStyle(0x3a2008, 1);
-      this.obstacleGfx.beginPath();
-      this.obstacleGfx.moveTo(s.x,       s.y);
-      this.obstacleGfx.lineTo(s.x + hw,  s.y - hh);
-      this.obstacleGfx.lineTo(s.x + hw,  s.y - hh - ht);
-      this.obstacleGfx.lineTo(s.x,       s.y - ht);
-      this.obstacleGfx.closePath();
-      this.obstacleGfx.fillPath();
-
-      // Left face (mid tone)
-      this.obstacleGfx.fillStyle(0x543014, 1);
-      this.obstacleGfx.beginPath();
-      this.obstacleGfx.moveTo(s.x,      s.y);
-      this.obstacleGfx.lineTo(s.x - hw, s.y - hh);
-      this.obstacleGfx.lineTo(s.x - hw, s.y - hh - ht);
-      this.obstacleGfx.lineTo(s.x,      s.y - ht);
-      this.obstacleGfx.closePath();
-      this.obstacleGfx.fillPath();
-
-      // Top face (lightest — sun-lit)
-      this.obstacleGfx.fillStyle(0x7a4c24, 1);
-      this.obstacleGfx.beginPath();
-      this.obstacleGfx.moveTo(s.x,      s.y - ht);
-      this.obstacleGfx.lineTo(s.x + hw, s.y - hh - ht);
-      this.obstacleGfx.lineTo(s.x,      s.y - hh * 2 - ht);
-      this.obstacleGfx.lineTo(s.x - hw, s.y - hh - ht);
-      this.obstacleGfx.closePath();
-      this.obstacleGfx.fillPath();
-
-      // Crisp outline
-      this.obstacleGfx.lineStyle(1, 0x1e0e04, 0.8);
-      this.obstacleGfx.beginPath();
-      this.obstacleGfx.moveTo(s.x,      s.y - ht);
-      this.obstacleGfx.lineTo(s.x + hw, s.y - hh - ht);
-      this.obstacleGfx.lineTo(s.x,      s.y - hh * 2 - ht);
-      this.obstacleGfx.lineTo(s.x - hw, s.y - hh - ht);
-      this.obstacleGfx.closePath();
-      this.obstacleGfx.strokePath();
-      this.obstacleGfx.beginPath();
-      this.obstacleGfx.moveTo(s.x, s.y);
-      this.obstacleGfx.lineTo(s.x, s.y - ht);
-      this.obstacleGfx.moveTo(s.x + hw, s.y - hh);
-      this.obstacleGfx.lineTo(s.x + hw, s.y - hh - ht);
-      this.obstacleGfx.moveTo(s.x - hw, s.y - hh);
-      this.obstacleGfx.lineTo(s.x - hw, s.y - hh - ht);
-      this.obstacleGfx.strokePath();
-    }
-  }
-
   // ── _placeTiles ──────────────────────────────────────────────────────────────
   _placeTiles() {
     const cx = Math.round(this.wx), cy = Math.round(this.wy);
@@ -619,35 +608,83 @@ class GameScene extends Phaser.Scene {
     const time = this.time.now / 1000;
     const cam  = toScreen(this.wx, this.wy);
 
+    // Build a unified draw-list of Caraibeira zones + saplings, sorted back-to-front
+    const list = [];
     for (const z of this.zones) {
       const s = toScreen(z.wx, z.wy);
-      if (Math.abs(s.x - cam.x) > 900 || Math.abs(s.y - cam.y) > 550) continue;
+      if (Math.abs(s.x - cam.x) > 1000 || Math.abs(s.y - cam.y) > 650) continue;
+      list.push({ kind: 'zone', obj: z, s, isoY: z.wx + z.wy });
+    }
+    for (const sp of this.saplings) {
+      const s = toScreen(sp.wx, sp.wy);
+      if (Math.abs(s.x - cam.x) > 1000 || Math.abs(s.y - cam.y) > 650) continue;
+      list.push({ kind: 'sapling', obj: sp, s, isoY: sp.wx + sp.wy });
+    }
+    list.sort((a, b) => a.isoY - b.isoY); // ascending isoY = further back = draw first
 
+    const g = this.zoneGfx;
+
+    for (const { kind, obj, s } of list) {
+      if (kind === 'sapling') {
+        const sc = obj.sc;
+        // Trunk (2× original dimensions)
+        g.fillStyle(0x3a1e08, 0.88);
+        g.fillRect(s.x - 4, s.y - sc * 92, 8, sc * 88);
+        // Lower canopy
+        g.fillStyle(0x1e6420, 0.82);
+        g.fillEllipse(s.x, s.y - sc * 64, sc * 104, sc * 52);
+        // Upper canopy
+        g.fillStyle(0x2e8830, 0.88);
+        g.fillEllipse(s.x, s.y - sc * 100, sc * 68, sc * 34);
+        continue;
+      }
+
+      // ── Caraibeira zone tree (2× original dimensions) ────────────────────
+      const z = obj;
       const rw = z.radius * 64;
       const rh = z.radius * 32;
+      const pulse = z.bloomed
+        ? 0.70 + 0.30 * Math.sin(time * 2.5 + z.phase)
+        : 0.60 + 0.40 * Math.sin(time * 1.8 + z.phase);
 
+      // Ground aura
       if (z.bloomed) {
-        // Bloomed — bright cyan glow, faster pulse
-        const pulse = 0.7 + 0.3 * Math.sin(time * 2.5 + z.phase);
-        this.zoneGfx.fillStyle(0x00ffcc, 0.06 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 3.2, rh * 3.2);
-        this.zoneGfx.fillStyle(0x44ffcc, 0.13 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 2, rh * 2);
-        this.zoneGfx.fillStyle(0x88ffee, 0.22 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 1.2, rh * 1.2);
-        this.zoneGfx.lineStyle(2, 0x44ffcc, 0.7 * pulse);
-        this.zoneGfx.strokeEllipse(s.x, s.y, rw * 2, rh * 2);
+        g.fillStyle(0x00ffcc, 0.05 * pulse);
+        g.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
+        g.fillStyle(0x44ffdd, 0.10 * pulse);
+        g.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
+        g.lineStyle(1.5, 0x44ffcc, 0.55 * pulse);
+        g.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
       } else {
-        // Normal — green glow
-        const pulse = 0.6 + 0.4 * Math.sin(time * 1.8 + z.phase);
-        this.zoneGfx.fillStyle(0x44ff66, 0.05 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 3.2, rh * 3.2);
-        this.zoneGfx.fillStyle(0x44ff66, 0.09 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 2, rh * 2);
-        this.zoneGfx.fillStyle(0x88ff88, 0.13 * pulse);
-        this.zoneGfx.fillEllipse(s.x, s.y, rw * 1.2, rh * 1.2);
-        this.zoneGfx.lineStyle(1.5, 0x66ff88, 0.4 * pulse);
-        this.zoneGfx.strokeEllipse(s.x, s.y, rw * 2, rh * 2);
+        g.fillStyle(0x44ff66, 0.04 * pulse);
+        g.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
+        g.fillStyle(0x66ff88, 0.08 * pulse);
+        g.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
+        g.lineStyle(1, 0x66ff88, 0.30 * pulse);
+        g.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
+      }
+
+      // Trunk — 2× width and height
+      g.fillStyle(0x3a1e08, 1);
+      g.fillRect(s.x - 10, s.y - 136, 20, 132);
+
+      // Canopy — three tiers at 2× size and height
+      if (z.bloomed) {
+        g.fillStyle(0x1aaa66, 0.95);
+        g.fillEllipse(s.x, s.y - 144, 188, 94);
+        g.fillStyle(0x33ddaa, 0.97);
+        g.fillEllipse(s.x, s.y - 200, 140, 70);
+        g.fillStyle(0x77ffcc, 1.0);
+        g.fillEllipse(s.x, s.y - 244, 88, 44);
+        g.lineStyle(1.5, 0xaaffee, 0.6 * pulse);
+        g.strokeEllipse(s.x, s.y - 200, 140, 70);
+      } else {
+        g.fillStyle(0x1a6622, 0.94);
+        g.fillEllipse(s.x, s.y - 144, 188, 94);
+        g.fillStyle(0x2d8834, 0.97);
+        g.fillEllipse(s.x, s.y - 200, 140, 70);
+        g.fillStyle(0x56bb44, 1.0);
+        g.fillEllipse(s.x, s.y - 244, 88, 44);
       }
     }
   }
@@ -732,7 +769,15 @@ class GameScene extends Phaser.Scene {
   _drawShadow() {
     this.shadowGfx.clear();
     const s = toScreen(this.wx, this.wy);
-    this.shadowGfx.fillStyle(0x000000, 0.25);
+
+    // Shadow turns red and pulses when the player is close to a trap
+    const nearTrap = this.traps.some(t => Math.hypot(this.wx - t.wx, this.wy - t.wy) < 1.1);
+    if (nearTrap) {
+      const flicker = 0.40 + 0.45 * Math.abs(Math.sin(this.time.now / 130));
+      this.shadowGfx.fillStyle(0xcc1100, 0.60 * flicker);
+    } else {
+      this.shadowGfx.fillStyle(0x000000, 0.25);
+    }
     this.shadowGfx.fillEllipse(s.x, s.y + 40, 38, 14);
   }
 
@@ -837,60 +882,65 @@ class GameScene extends Phaser.Scene {
 
   // ── _genWorld ────────────────────────────────────────────────────────────────
   _genWorld() {
-    // Helper: checks that a world point projects inside the camera bounds
-    // with a given screen-pixel margin on each axis.
+    // Helper: checks that a world point is safely inside the camera bounds.
     const inBounds = (wx, wy, mX, mY) => {
       const sx = (wx - wy) * 64, sy = (wx + wy) * 32;
-      return Math.abs(sx) + mX < 1150 && Math.abs(sy) + mY < 850;
+      return Math.abs(sx) + mX < 1750 && Math.abs(sy) + mY < 1300;
     };
 
-    // Caraibeira zones — spread out, not overlapping, not at origin, fully inside map
+    // Habitat decline: fewer Caraibeira trees as years pass
+    const yearDelta  = Math.max(0, this.currentYear - 1987);
+    const numZones   = Math.max(1, NUM_ZONES - Math.floor(yearDelta / 20));
+    this.pointsToWin = Math.min(POINTS_TO_WIN, numZones);
+
+    // Caraibeira zones — spread out, not overlapping
     this.zones = [];
-    for (let i = 0; i < NUM_ZONES; i++) {
+    for (let i = 0; i < numZones; i++) {
       let wx, wy, ok, tries = 0;
       do {
         wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
         wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
-        ok = Math.hypot(wx, wy) > 10 &&
-             this.zones.every(z => Math.hypot(wx - z.wx, wy - z.wy) > ZONE_R * 2.8) &&
-             inBounds(wx, wy, ZONE_R * 64, ZONE_R * 32); // zone visual fits inside map
-      } while (!ok && ++tries < 200);
+        ok = Math.hypot(wx, wy) > 15 &&
+             this.zones.every(z => Math.hypot(wx - z.wx, wy - z.wy) > ZONE_R * 2.0) &&
+             inBounds(wx, wy, ZONE_R * 64, ZONE_R * 32);
+      } while (!ok && ++tries < 500);
       this.zones.push({ wx, wy, radius: ZONE_R, phase: Math.random() * Math.PI * 2, bloomed: false });
     }
 
-    // Traps — in open areas, away from zones and player start
-    this.traps = [];
+    // Saplings — smaller collideable trees filling out the forest
+    this.saplings = [];
     let tries = 0;
-    while (this.traps.length < NUM_TRAPS && tries++ < 1200) {
+    while (this.saplings.length < NUM_SAPLINGS && tries++ < 4000) {
       const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
-      if (Math.hypot(wx, wy) < 7) continue;
+      if (!inBounds(wx, wy, 40, 40)) continue;
+      if (Math.hypot(wx, wy) < 5) continue;
+      if (this.zones.some(z => Math.hypot(wx - z.wx, wy - z.wy) < z.radius + 1.5)) continue;
+      if (this.saplings.some(s => Math.hypot(wx - s.wx, wy - s.wy) < 2.5)) continue;
+      const sc = 0.45 + Math.random() * 0.45;
+      this.saplings.push({ wx, wy, sc, phase: Math.random() * Math.PI * 2 });
+    }
+
+    // Traps — kept clear of all trees
+    this.traps = [];
+    tries = 0;
+    while (this.traps.length < NUM_TRAPS && tries++ < 3000) {
+      const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      if (Math.hypot(wx, wy) < 10) continue;
       if (!inBounds(wx, wy, 40, 40)) continue;
       if (this.zones.some(z => Math.hypot(wx - z.wx, wy - z.wy) < z.radius + 1.5)) continue;
+      if (this.saplings.some(s => Math.hypot(wx - s.wx, wy - s.wy) < 1.5)) continue;
       this.traps.push({ wx, wy });
     }
 
-    // Rocky obstacles — scattered boulders the player must navigate around
-    this.rocks = [];
-    tries = 0;
-    while (this.rocks.length < NUM_ROCKS && tries++ < 2000) {
-      const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
-      const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
-      if (Math.hypot(wx, wy) < 4) continue;   // keep origin clear
-      if (!inBounds(wx, wy, 80, 60)) continue;
-      if (this.zones.some(z => Math.hypot(wx - z.wx, wy - z.wy) < z.radius + ROCK_R + 1.5)) continue;
-      if (this.traps.some(t => Math.hypot(wx - t.wx, wy - t.wy) < ROCK_R + 1.5)) continue;
-      if (this.rocks.some(r => Math.hypot(wx - r.wx, wy - r.wy) < ROCK_R * 2 + 1.0)) continue;
-      this.rocks.push({ wx, wy, radius: ROCK_R });
-    }
-
-    // Poachers — spread across the world, away from start and zones
+    // Poachers
     this.poachers = [];
     tries = 0;
-    while (this.poachers.length < NUM_POACHERS && tries++ < 1200) {
+    while (this.poachers.length < NUM_POACHERS && tries++ < 2000) {
       const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
-      if (Math.hypot(wx, wy) < 8) continue;
+      if (Math.hypot(wx, wy) < 12) continue;
       if (!inBounds(wx, wy, 60, 60)) continue;
       if (this.zones.some(z => Math.hypot(wx - z.wx, wy - z.wy) < z.radius + 2)) continue;
       this.poachers.push({
@@ -900,12 +950,12 @@ class GameScene extends Phaser.Scene {
       });
     }
 
-    // Ghost Reaper — starts far from origin, inside bounds
+    // Ghost Reaper — starts far from origin
     let rx, ry, rtries = 0;
     do {
       rx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       ry = (Math.random() - 0.5) * WORLD_SPAN * 2;
-    } while ((Math.hypot(rx, ry) < 12 || !inBounds(rx, ry, 60, 60)) && rtries++ < 400);
+    } while ((Math.hypot(rx, ry) < 18 || !inBounds(rx, ry, 60, 60)) && rtries++ < 400);
     this.reaper = { wx: rx, wy: ry, alpha: 0.2 };
   }
 
@@ -938,7 +988,7 @@ class GameScene extends Phaser.Scene {
         this.spiritGhostTimer = GHOST_TRAIL_DUR; // grant Speed Ghost trail
         this.zoneHoldTimer = 0;
         this.activeZoneIdx = -1;
-        if (this.score >= POINTS_TO_WIN && !this.portalActive) {
+        if (this.score >= this.pointsToWin && !this.portalActive) {
           this.portalActive = true;
         }
       }
@@ -1037,12 +1087,28 @@ class GameScene extends Phaser.Scene {
     }
     this.timerText.setVisible(false);
 
-    // ── Trees Saved counter (top-left) ──
+    // ── Persistent HUD texts ─────────────────────────────────────────────────
+    this.yearText.setText(`Year: ${this.currentYear}`);
     const ghostSuffix = this.spiritGhostTimer > 0
       ? `  ✦ ${Math.ceil(this.spiritGhostTimer)}s` : '';
-    this.spiritCountText.setText(
-      `Trees Saved: ${this.score} / ${POINTS_TO_WIN}${ghostSuffix}`
-    );
+    this.treesSavedText.setText(`Trees Saved: ${this.score} / ${this.pointsToWin}${ghostSuffix}`);
+
+    // Ancestral Call status
+    if (this.ancestralCD > 0) {
+      this.ancestralText.setColor('#666688').setText(`[E] Ancestral Call — ${Math.ceil(this.ancestralCD)}s`);
+    } else {
+      this.ancestralText.setColor('#88ccff').setText('[E] Ancestral Call');
+    }
+
+    // ── Health bar ───────────────────────────────────────────────────────────
+    const hbX = 20, hbY = 60, hbW = 120, hbH = 10;
+    const maxHp = 3, hp = this.playerHealth;
+    this.hudGfx.fillStyle(0x222222, 0.8);
+    this.hudGfx.fillRect(hbX, hbY, hbW, hbH);
+    this.hudGfx.fillStyle(0x44cc44, 0.9);
+    this.hudGfx.fillRect(hbX, hbY, hbW * (hp / maxHp), hbH);
+    this.hudGfx.lineStyle(1.5, 0xffffff, 0.5);
+    this.hudGfx.strokeRect(hbX, hbY, hbW, hbH);
   }
 
   // ── _triggerLevelClear ───────────────────────────────────────────────────────
@@ -1052,24 +1118,23 @@ class GameScene extends Phaser.Scene {
     this.dead = true;
     this.vx = 0; this.vy = 0;
 
-    this.cameras.main.fade(1800, 255, 255, 255); // fade to white
-    this.cameras.main.once('camerafadeoutcomplete', () => {
-      const w = this.scale.width;
-      const h = this.scale.height;
-      const opts = { fontFamily: 'Georgia, "Times New Roman", serif' };
+    const nextYear = this.currentYear + 2;
+    const w = this.scale.width, h = this.scale.height;
+    const font = 'Arial, Helvetica, sans-serif';
 
-      // White background fill so text sits on pure white
-      const bg = this.add.rectangle(w / 2, h / 2, w, h, 0xffffff)
-        .setScrollFactor(0).setDepth(199);
+    // White overlay tweened in — avoids camera.fade() which occludes depth-200+ objects
+    const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0xffffff)
+      .setScrollFactor(0).setDepth(200).setAlpha(0);
 
-      const msg = this.add.text(w / 2, h / 2,
-        'The spirit has guided this generation to safety.\nThe legacy continues…', {
-          ...opts, fontSize: '26px', color: '#1a2010', align: 'center',
-        }).setOrigin(0.5).setScrollFactor(0).setDepth(200).setAlpha(0);
+    const msg = this.add.text(w / 2, h / 2,
+      `The Spirit is strengthened.\nThe year is now ${nextYear}.`, {
+        fontFamily: font, fontSize: '34px', color: '#1a2010',
+        stroke: '#f0f0f0', strokeThickness: 2, align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
 
-      this.tweens.add({ targets: msg, alpha: 1, duration: 1100, delay: 300 });
-      this.time.delayedCall(5000, () => this.scene.restart());
-    });
+    this.tweens.add({ targets: overlay, alpha: 1, duration: 1800 });
+    this.tweens.add({ targets: msg,    alpha: 1, duration: 1100, delay: 1600 });
+    this.time.delayedCall(6000, () => this.scene.restart({ year: nextYear }));
   }
 
   // ── _triggerDeath ─────────────────────────────────────────────────────────────
@@ -1078,27 +1143,113 @@ class GameScene extends Phaser.Scene {
     this.dead = true;
     this.vx = 0; this.vy = 0;
 
+    const nextYear = this.currentYear + 10;
+    const w = this.scale.width, h = this.scale.height;
+    const font = 'Arial, Helvetica, sans-serif';
+
     this.cameras.main.shake(200, 0.025);
-    this.time.delayedCall(200, () => {
-    this.cameras.main.fade(1200, 0, 0, 0);
-    this.cameras.main.once('camerafadeoutcomplete', () => {
-      const w = this.scale.width;
-      const h = this.scale.height;
-      const opts = { fontFamily: 'Georgia, "Times New Roman", serif' };
 
-      const year = this.add.text(w / 2, h / 2 - 55, '1990', {
-        ...opts, fontSize: '58px', color: '#d4a84b',
-      }).setOrigin(0.5).setScrollFactor(0).setDepth(200).setAlpha(0);
+    // Black overlay tweened in — avoids camera.fade() which occludes depth-200+ objects
+    const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0x000000)
+      .setScrollFactor(0).setDepth(200).setAlpha(0);
 
-      const msg = this.add.text(w / 2, h / 2 + 18,
-        'A lineage lost to the trade.\nThe next generation takes flight…', {
-          ...opts, fontSize: '22px', color: '#e8dfc0', align: 'center',
-        }).setOrigin(0.5).setScrollFactor(0).setDepth(200).setAlpha(0);
+    const headline = this.add.text(w / 2, h / 2 - 44,
+      `${this.currentYear}: A lineage lost.`, {
+        fontFamily: font, fontSize: '46px', color: '#ffffff',
+        stroke: '#000000', strokeThickness: 4, align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
 
-      this.tweens.add({ targets: [year, msg], alpha: 1, duration: 900, delay: 250 });
-      this.time.delayedCall(5200, () => this.scene.restart());
+    const flavour = this.add.text(w / 2, h / 2 + 18,
+      'Years pass in silence. The spirit returns...', {
+        fontFamily: font, fontSize: '22px', color: '#aabbcc',
+        stroke: '#000000', strokeThickness: 3, align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+    const sub = this.add.text(w / 2, h / 2 + 60,
+      'Press SPACE to return as the next generation.', {
+        fontFamily: font, fontSize: '16px', color: '#666688',
+        stroke: '#000000', strokeThickness: 2, align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+    this.tweens.add({ targets: overlay,            alpha: 1, duration: 1200, delay: 200 });
+    this.tweens.add({ targets: [headline, flavour], alpha: 1, duration: 900,  delay: 900 });
+    this.tweens.add({ targets: sub,                alpha: 1, duration: 700,  delay: 2000 });
+
+    // Listen for SPACE after overlay has faded in
+    this.time.delayedCall(1200, () => {
+      this.input.keyboard.once('keydown-SPACE', () => {
+        this.scene.restart({ year: nextYear });
+      });
     });
-    }); // end shake delayedCall
+  }
+
+  // ── _updateAncestralCall ──────────────────────────────────────────────────────
+  _updateAncestralCall(dt) {
+    if (this.ancestralCD > 0)     this.ancestralCD     = Math.max(0, this.ancestralCD - dt);
+    if (this.ancestralReveal > 0) this.ancestralReveal = Math.max(0, this.ancestralReveal - dt);
+
+    // Advance each ripple ring outward and age it
+    for (let i = this.ancestralRipples.length - 1; i >= 0; i--) {
+      const rip = this.ancestralRipples[i];
+      rip.r    += 9 * dt;  // expand 9 world-units/sec
+      rip.life -= dt;
+      if (rip.life <= 0) this.ancestralRipples.splice(i, 1);
+    }
+
+    // Single-press detection for E
+    const eNow = this.keys.E.isDown;
+    if (eNow && !this.prevE && this.ancestralCD <= 0) {
+      this.ancestralCD     = 10;
+      this.ancestralReveal = 2;
+      // Spawn 3 staggered rings from player position
+      for (let i = 0; i < 3; i++) {
+        const life = 1.6 + i * 0.25;
+        this.ancestralRipples.push({
+          wx: this.wx, wy: this.wy,
+          r: i * 1.8,      // stagger so rings don't all start at the same radius
+          life, maxLife: life,
+        });
+      }
+    }
+    this.prevE = eNow;
+  }
+
+  // ── _drawAncestralCall ────────────────────────────────────────────────────────
+  _drawAncestralCall() {
+    this.revealGfx.clear();
+
+    // ── Expanding ripple rings (drawn in world space, above fog) ──
+    for (const rip of this.ancestralRipples) {
+      const s     = toScreen(rip.wx, rip.wy);
+      const alpha = (rip.life / rip.maxLife) * 0.85;
+      const rw    = rip.r * 128;   // iso half-width (world × tile width)
+      const rh    = rip.r * 64;    // iso half-height
+      this.revealGfx.lineStyle(2.5, 0x44aaff, alpha);
+      this.revealGfx.strokeEllipse(s.x, s.y, rw, rh);
+      // Inner fill shimmer
+      this.revealGfx.fillStyle(0x88ccff, alpha * 0.08);
+      this.revealGfx.fillEllipse(s.x, s.y, rw, rh);
+    }
+
+    // ── Zone reveal — bright beacon rings above fog for 2 seconds ──
+    if (this.ancestralReveal > 0) {
+      const pulse  = 0.65 + 0.35 * Math.abs(Math.sin(this.time.now / 160));
+      const fadeIn = Math.min(1, this.ancestralReveal / 0.3);  // quick fade-in
+      const alpha  = pulse * fadeIn;
+      for (const z of this.zones) {
+        if (z.bloomed) continue;
+        const s  = toScreen(z.wx, z.wy);
+        const rw = z.radius * 128;
+        const rh = z.radius * 64;
+        this.revealGfx.fillStyle(0x22ddff, 0.14 * alpha);
+        this.revealGfx.fillEllipse(s.x, s.y, rw * 2.4, rh * 2.4);
+        this.revealGfx.lineStyle(3, 0x44eeff, 0.95 * alpha);
+        this.revealGfx.strokeEllipse(s.x, s.y, rw * 2.0, rh * 2.0);
+        // Bright centre dot so it's visible even fully inside fog
+        this.revealGfx.fillStyle(0xaaffff, 0.7 * alpha);
+        this.revealGfx.fillCircle(s.x, s.y, 8);
+      }
+    }
   }
 
   // ── _makeFog ─────────────────────────────────────────────────────────────────
