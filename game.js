@@ -1,25 +1,30 @@
 // ─── Constants ────────────────────────────────────────────────────────────────
-const TILE_W = 128;
-const TILE_H = 64;
-const RENDER_R = 12;   // tile render radius — large enough for fog to cover the edge seam
 
 // Movement
 const SPEED       = 6.4;
 const SPEED_BOOST = 1.45;  // multiplier while Mate is active
 const ACCEL       = 32;    // softer ramp-up for bird-like feel
 const DRAG        = 7;     // low drag → long glide, not a helicopter stop
+const GLIDE_SPEED    = SPEED * 0.40; // glide cruise speed — 20% slower than before
+const GLIDE_TURN_SPD = 1.70;         // rad/sec — 2× turn rate → 50% tighter radius (~3.7s/loop)
 
 // Dash
 const DASH_V   = 30;
 const DASH_DUR = 0.16;
 const DASH_CD  = 0.70;
 
+// Energy
+const DASH_ENERGY_COST  = 0.30;  // 30% of bar consumed per dash
+const ENERGY_REFILL_SPD = 0.20;  // 20% per second while anchoring at a Caraíba tree
+
 // World generation
-const NUM_ZONES      = 16;     // base count — declines with year
-const ZONE_R         = 3.23;   // Caraibeira zone radius
-const ZONE_TRUNK_R   = 0.45;   // collideable trunk radius (world units)
+const NUM_ZONES      = 8;      // 50% of original — sparser, harder to find
+const ZONE_R         = 2.58;   // Caraibeira zone radius — 20% smaller than original 3.23
+const ZONE_TRUNK_R   = 0.45;   // visual/depth-sort trunk radius (world units)
+const ZONE_COL_R     = 0.14;   // collision-only radius — just the physical trunk base
 const NUM_TRAPS      = 22;
-const NUM_SAPLINGS   = 90;     // 250% of original 36 — two types filling the forest
+const NUM_SAPLINGS   = 150;    // dense Caatinga; min-distance check keeps it organic
+const NUM_TUFTS      = 62;     // 250% of original 25 — rich ground detail
 const WORLD_SPAN     = 27;     // 50% larger than original 18 — fits 3600×2700 bounds
 
 // Enemies
@@ -58,22 +63,15 @@ class GameScene extends Phaser.Scene {
   init(data) {
     this.currentYear  = (data && data.year) ? data.year : 1987;
     this.playerHealth = 3; // placeholder — full bar until health system is built
+    this.energy       = 1.0; // Energy bar: 0.0 – 1.0 (full)
+    this.glideAngle   = (data && data.glideAngle) ? data.glideAngle : Math.random() * Math.PI * 2;
   }
 
   // ── create ──────────────────────────────────────────────────────────────────
   create() {
-    // Ochre Caatinga floor tiles
-    this._makeTex('t0', 0xb07828, 0x8a5818);
-    this._makeTex('t1', 0xbe8832, 0x7a4810);
-
-    // Tile sprite pool
-    const side = RENDER_R * 2 + 1;
-    this.tilePool = Array.from({ length: side * side }, () =>
-      this.add.sprite(0, 0, 't0').setOrigin(0.5, 0.5).setDepth(0)
-    );
-
     // Graphics layers (depth order matters)
     this.grassGfx  = this.add.graphics().setDepth(0.5);
+    this.tuftGfx   = this.add.graphics().setDepth(0.55); // ground tufts, above grass, below trees
     this.zoneGfx   = this.add.graphics().setDepth(1);
     this.portalGfx = this.add.graphics().setDepth(1.5);
     this.trapGfx   = this.add.graphics().setDepth(0.7);
@@ -166,6 +164,12 @@ class GameScene extends Phaser.Scene {
       stroke: '#000000', strokeThickness: 3,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
 
+    // Energy label — below year (bar drawn in _drawHUD via hudGfx)
+    this.energyLabel = this.add.text(HW - 20, 44, 'Energy', {
+      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '12px', color: '#88ccff',
+      stroke: '#000000', strokeThickness: 2,
+    }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
+
     // Health label (bar is drawn in _drawHUD via hudGfx)
     this.healthLabel = this.add.text(20, 44, 'Health', {
       fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '12px', color: '#cccccc',
@@ -178,7 +182,7 @@ class GameScene extends Phaser.Scene {
       stroke: '#000000', strokeThickness: 2,
     }).setOrigin(0, 0).setScrollFactor(0).setDepth(100);
 
-    this.cameras.main.setBackgroundColor('#b0a890'); // warm gray — blends with fog edge
+    this.cameras.main.setBackgroundColor('#b07828'); // solid ochre Caatinga floor
     this.cameras.main.setBounds(-1800, -1350, 3600, 2700); // 50% larger map
     this._makeFog();
   }
@@ -196,8 +200,8 @@ class GameScene extends Phaser.Scene {
     this._updateScore(dt);
     this._updateAncestralCall(dt);
 
-    this._placeTiles();
     this._drawGrass();
+    this._drawTufts();
     this._drawZones();
     this._drawPortal();
     this._drawTraps();
@@ -212,37 +216,47 @@ class GameScene extends Phaser.Scene {
     const s = toScreen(this.wx, this.wy);
     this.cameras.main.centerOn(s.x, s.y);
 
-    // Tree depth: go behind a tree when entity is north of its trunk base
-    let pd = 6, sd = 4, td = 3, ed = 5.5;
-    const pIsoY = this.wx + this.wy;
+    // ── Y-sort depth: entity depth is determined by isoY position vs each tree ──
+    // Trees on zoneGfx (depth 1) occlude entities with depth < 1.
+    // Default = in front of trees; drops to 0.5/0.6 when entity's isoY < tree's isoY.
+    const pIsoY  = this.wx + this.wy;
+    const rIsoY  = this.reaper.wx + this.reaper.wy;
+    let pd = 6, sd = 5.9, td = 5.8, ed = 5.5;
 
+    // ── Large Caraibeira zones ──
     for (const z of this.zones) {
       const zIsoY = z.wx + z.wy;
-      if (pd > 1 &&
-          Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius * 2.5 &&
-          pIsoY < zIsoY) {
-        pd = 0.5; sd = 0.4; td = 0.3;
-      }
-      if (ed > 1 &&
-          Math.hypot(this.reaper.wx - z.wx, this.reaper.wy - z.wy) < z.radius * 2.0 &&
-          this.reaper.wx + this.reaper.wy < zIsoY) {
-        ed = 0.6;
-      }
+      if (pd > 1 && pIsoY < zIsoY &&
+          Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius * 2.5)
+        { pd = 0.5; sd = 0.4; td = 0.3; }
+      if (ed > 1 && rIsoY < zIsoY &&
+          Math.hypot(this.reaper.wx - z.wx, this.reaper.wy - z.wy) < z.radius * 2.0)
+        { ed = 0.6; }
       if (ed > 1) {
         for (const p of this.poachers) {
-          if (Math.hypot(p.wx - z.wx, p.wy - z.wy) < z.radius * 2.0 &&
-              p.wx + p.wy < zIsoY) {
-            ed = 0.6; break;
-          }
+          if (p.wx + p.wy < zIsoY &&
+              Math.hypot(p.wx - z.wx, p.wy - z.wy) < z.radius * 2.0)
+            { ed = 0.6; break; }
         }
       }
     }
-    // Saplings also occlude the player
-    if (pd > 1) {
-      for (const sp of this.saplings) {
-        if (Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < sp.trunkR * 4.5 &&
-            pIsoY < sp.wx + sp.wy) {
-          pd = 0.5; sd = 0.4; td = 0.3; break;
+
+    // ── Saplings occlude player AND enemies (not just player) ──
+    for (const sp of this.saplings) {
+      if (pd <= 0.6 && ed <= 0.7) break; // both already occluded — early exit
+      const spIsoY = sp.wx + sp.wy;
+      const spR    = sp.trunkR * 4.5;
+      if (pd > 1 && pIsoY < spIsoY &&
+          Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < spR)
+        { pd = 0.5; sd = 0.4; td = 0.3; }
+      if (ed > 1 && rIsoY < spIsoY &&
+          Math.hypot(this.reaper.wx - sp.wx, this.reaper.wy - sp.wy) < spR)
+        { ed = 0.6; }
+      if (ed > 1) {
+        for (const p of this.poachers) {
+          if (p.wx + p.wy < spIsoY &&
+              Math.hypot(p.wx - sp.wx, p.wy - sp.wy) < spR)
+            { ed = 0.6; break; }
         }
       }
     }
@@ -277,15 +291,16 @@ class GameScene extends Phaser.Scene {
       if (fl > 0) { this.fx /= fl; this.fy /= fl; }
     }
 
-    // Dash — single press
+    // Dash — single press; requires Energy > 0; consumes 30% of bar
     const spNow = k.SPACE.isDown;
-    if (spNow && !this.prevSpace && !this.dashing && this.dashCD <= 0) {
+    if (spNow && !this.prevSpace && !this.dashing && this.dashCD <= 0 && this.energy > 0) {
       this.dashing   = true;
       this.dashTimer = DASH_DUR;
       this.dashCD    = DASH_CD;
       this.ddx = this.fx; this.ddy = this.fy;
       this.vx = this.ddx * DASH_V;
       this.vy = this.ddy * DASH_V;
+      this.energy = Math.max(0, this.energy - DASH_ENERGY_COST);
     }
     this.prevSpace = spNow;
     if (this.dashCD > 0) this.dashCD -= dt;
@@ -303,12 +318,49 @@ class GameScene extends Phaser.Scene {
       if (il > 0) {
         this.vx += ix * ACCEL * dt;
         this.vy += iy * ACCEL * dt;
+        // Keep glide angle synced so the thermal circle picks up smoothly when input stops
+        const spd = Math.hypot(this.vx, this.vy);
+        if (spd > 0.5) this.glideAngle = Math.atan2(this.vy, this.vx);
       } else {
-        const sp = Math.hypot(this.vx, this.vy);
-        if (sp > 0) {
-          const ns = Math.max(0, sp - DRAG * dt);
-          this.vx *= ns / sp;
-          this.vy *= ns / sp;
+        // No input — check if inside a safe zone; if so, lock to an orbital glide around it
+        const orbitZone = this.zones
+          ? this.zones.find(z => Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius)
+          : null;
+
+        if (orbitZone) {
+          // Orbital glide: kinematically locked to 50% of zone radius centred on the tree.
+          // Position is set directly — no velocity drift can push the bird out.
+          const orbitR = orbitZone.radius * 0.50;
+
+          // Derive current angle from tree centre, then advance by one frame
+          const odx = this.wx - orbitZone.wx;
+          const ody = this.wy - orbitZone.wy;
+          this.glideAngle = Math.atan2(ody, odx) + GLIDE_TURN_SPD * dt;
+
+          // Directly place bird on the orbit ring (anchor timer will never be interrupted)
+          const prevWx = this.wx, prevWy = this.wy;
+          this.wx = orbitZone.wx + Math.cos(this.glideAngle) * orbitR;
+          this.wy = orbitZone.wy + Math.sin(this.glideAngle) * orbitR;
+
+          // Derive velocity from the displacement so dash/particles stay consistent
+          this.vx = (this.wx - prevWx) / dt;
+          this.vy = (this.wy - prevWy) / dt;
+
+          // Facing = tangent direction of the circle
+          const sp2 = Math.hypot(this.vx, this.vy);
+          if (sp2 > 0.01) { this.fx = this.vx / sp2; this.fy = this.vy / sp2; }
+        } else {
+          // Free thermal glide: wide lazy circle with no input
+          this.glideAngle += GLIDE_TURN_SPD * dt;
+          const gx = Math.cos(this.glideAngle);
+          const gy = Math.sin(this.glideAngle);
+          this.vx += (gx * GLIDE_SPEED - this.vx) * 2.5 * dt;
+          this.vy += (gy * GLIDE_SPEED - this.vy) * 2.5 * dt;
+          const gl = 1 - Math.pow(0.01, dt * 3);
+          this.fx += (gx - this.fx) * gl;
+          this.fy += (gy - this.fy) * gl;
+          const fl2 = Math.hypot(this.fx, this.fy);
+          if (fl2 > 0) { this.fx /= fl2; this.fy /= fl2; }
         }
       }
       const sp = Math.hypot(this.vx, this.vy);
@@ -328,12 +380,12 @@ class GameScene extends Phaser.Scene {
       this.vx = 0; this.vy = 0;
     }
 
-    // Tree trunk collision — push player out and slide velocity along surface
+    // Tree trunk collision — only the physical base of the trunk (canopy has no hitbox)
     const PLAYER_R = 0.35;
     for (const z of this.zones) {
       const dx = this.wx - z.wx, dy = this.wy - z.wy;
       const dist = Math.hypot(dx, dy);
-      const minD = ZONE_TRUNK_R + PLAYER_R;
+      const minD = ZONE_COL_R + PLAYER_R;
       if (dist < minD && dist > 0.001) {
         const nx = dx / dist, ny = dy / dist;
         this.wx = z.wx + nx * minD;
@@ -345,7 +397,7 @@ class GameScene extends Phaser.Scene {
     for (const sp of this.saplings) {
       const dx = this.wx - sp.wx, dy = this.wy - sp.wy;
       const dist = Math.hypot(dx, dy);
-      const minD = sp.trunkR + PLAYER_R;
+      const minD = sp.trunkR * 0.32 + PLAYER_R; // 0.32× = trunk base only, canopy passable
       if (dist < minD && dist > 0.001) {
         const nx = dx / dist, ny = dy / dist;
         this.wx = sp.wx + nx * minD;
@@ -484,18 +536,11 @@ class GameScene extends Phaser.Scene {
 
   // ── _updateEnemies ───────────────────────────────────────────────────────────
   _updateEnemies(dt) {
-    // Sanctuary: any Caraibeira zone the player is currently inside
-    const inSanctuary = this.zones.some(z =>
-      Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius
-    );
-
-    // ── Poachers ──
+    // ── Poachers — keep wandering/chasing regardless of safe zones ──
     for (const p of this.poachers) {
       const distToPlayer = Math.hypot(this.wx - p.wx, this.wy - p.wy);
 
-      if (inSanctuary) {
-        p.state = 'return';
-      } else if (p.state === 'patrol' && distToPlayer < POACHER_DETECT_R) {
+      if (p.state === 'patrol' && distToPlayer < POACHER_DETECT_R) {
         p.state = 'chase';
       } else if (p.state === 'chase' && distToPlayer > POACHER_RETURN_R) {
         p.state = 'return';
@@ -551,15 +596,13 @@ class GameScene extends Phaser.Scene {
       if (n.dist > NET_RANGE) this.nets.splice(i, 1);
     }
 
-    // ── Reaper ──
-    if (!inSanctuary) {
-      const dx = this.wx - this.reaper.wx, dy = this.wy - this.reaper.wy;
-      const dist = Math.hypot(dx, dy);
-      if (dist > 0.01) {
-        const step = Math.min(dist, REAPER_SPEED * dt);
-        this.reaper.wx += (dx / dist) * step;
-        this.reaper.wy += (dy / dist) * step;
-      }
+    // ── Reaper — always pursues, safe zones offer no respite ──
+    const dx = this.wx - this.reaper.wx, dy = this.wy - this.reaper.wy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0.01) {
+      const step = Math.min(dist, REAPER_SPEED * dt);
+      this.reaper.wx += (dx / dist) * step;
+      this.reaper.wy += (dy / dist) * step;
     }
 
     // ── Spirit Sense ──
@@ -568,7 +611,7 @@ class GameScene extends Phaser.Scene {
     const rs = toScreen(this.reaper.wx, this.reaper.wy);
     const reaperScreenDist = Math.hypot(rs.x - ps.x, rs.y - ps.y);
     // Fog starts obscuring at ~130px from screen centre; sense range is 300px
-    this.spiritSense = !inSanctuary && reaperScreenDist > 130 && reaperScreenDist < 300;
+    this.spiritSense = reaperScreenDist > 130 && reaperScreenDist < 300;
   }
 
   // ── _drawEnemies ─────────────────────────────────────────────────────────────
@@ -646,19 +689,6 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  // ── _placeTiles ──────────────────────────────────────────────────────────────
-  _placeTiles() {
-    const cx = Math.round(this.wx), cy = Math.round(this.wy);
-    let i = 0;
-    for (let tx = cx - RENDER_R; tx <= cx + RENDER_R; tx++) {
-      for (let ty = cy - RENDER_R; ty <= cy + RENDER_R; ty++) {
-        const s = toScreen(tx, ty);
-        const tile = this.tilePool[i++];
-        tile.x = s.x; tile.y = s.y;
-        tile.setTexture((tx + ty) % 2 === 0 ? 't0' : 't1');
-      }
-    }
-  }
 
   // ── _drawGrass ───────────────────────────────────────────────────────────────
   _drawGrass() {
@@ -671,6 +701,36 @@ class GameScene extends Phaser.Scene {
       const rh = gp.size * 32;
       this.grassGfx.fillStyle(gp.color, gp.alpha);
       this.grassGfx.fillEllipse(s.x, s.y, rw, rh);
+    }
+  }
+
+  // ── _drawTufts ───────────────────────────────────────────────────────────────
+  _drawTufts() {
+    this.tuftGfx.clear();
+    const cam = toScreen(this.wx, this.wy);
+    for (const t of this.groundTufts) {
+      const s = toScreen(t.wx, t.wy);
+      if (Math.abs(s.x - cam.x) > 900 || Math.abs(s.y - cam.y) > 600) continue;
+      const sz = t.size * 33; // 50% larger than original 22
+      if (t.type === 0) {
+        // Dry grass tuft — yellow-brown layered ovals
+        this.tuftGfx.fillStyle(0x7a5c14, 0.85);
+        this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.5, sz * 0.55);
+        this.tuftGfx.fillStyle(0xa87c28, 0.55);
+        this.tuftGfx.fillEllipse(s.x - sz * 0.2, s.y - sz * 0.12, sz * 0.75, sz * 0.28);
+      } else if (t.type === 1) {
+        // Rock cluster — warm gray rounded shapes
+        this.tuftGfx.fillStyle(0x848078, 0.82);
+        this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.3, sz * 0.50);
+        this.tuftGfx.fillStyle(0xaaa89a, 0.48);
+        this.tuftGfx.fillEllipse(s.x - sz * 0.28, s.y - sz * 0.14, sz * 0.62, sz * 0.24);
+      } else {
+        // Thorny shrub — dark brownish-green Caatinga brush
+        this.tuftGfx.fillStyle(0x3e3010, 0.90);
+        this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.1, sz * 0.44);
+        this.tuftGfx.fillStyle(0x5a4418, 0.55);
+        this.tuftGfx.fillEllipse(s.x, s.y - sz * 0.13, sz * 0.72, sz * 0.30);
+      }
     }
   }
 
@@ -921,6 +981,14 @@ class GameScene extends Phaser.Scene {
       }
     }
 
+    // Spirit Pulse — blue charging glow while anchoring
+    if (this.activeZoneIdx >= 0) {
+      const t2 = this.time.now / 1000;
+      const pulse = 0.20 + 0.20 * Math.abs(Math.sin(t2 * 5.0));
+      this.playerGfx.fillStyle(0x33aaff, pulse);
+      this.playerGfx.fillCircle(s.x, s.y, SZ * 1.6);
+    }
+
     const fill = this.dashing ? 0x88ccff : 0x1e8fff;
     this.playerGfx.fillStyle(fill, 1);
     this.playerGfx.lineStyle(2, 0xbde8ff, 1);
@@ -983,11 +1051,11 @@ class GameScene extends Phaser.Scene {
       this.zones.push({ wx, wy, radius: ZONE_R, phase: Math.random() * Math.PI * 2, bloomed: false });
     }
 
-    // Saplings — two sizes of obstacle trees filling out the forest
+    // Saplings — two sizes of obstacle trees filling out the dense Caatinga forest
     // Type 0 = 90% of Caraibeira size, Type 1 = 80% of Caraibeira size
     this.saplings = [];
     let tries = 0;
-    while (this.saplings.length < NUM_SAPLINGS && tries++ < 6000) {
+    while (this.saplings.length < NUM_SAPLINGS && tries++ < 9000) {
       const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
       if (!inBounds(wx, wy, 40, 40)) continue;
@@ -997,6 +1065,23 @@ class GameScene extends Phaser.Scene {
       const type   = Math.random() < 0.5 ? 0 : 1;
       const trunkR = type === 0 ? 0.40 : 0.36;
       this.saplings.push({ wx, wy, type, trunkR, phase: Math.random() * Math.PI * 2 });
+    }
+
+    // Ground tufts — decorative Caatinga details (dry grass, rocks, shrubs); NO hitbox
+    this.groundTufts = [];
+    tries = 0;
+    while (this.groundTufts.length < NUM_TUFTS && tries++ < 2000) {
+      const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
+      if (!inBounds(wx, wy, 60, 60)) continue;
+      if (Math.hypot(wx, wy) < 4) continue;
+      if (this.zones.some(z   => Math.hypot(wx - z.wx,  wy - z.wy)  < z.radius)) continue;
+      if (this.saplings.some(s => Math.hypot(wx - s.wx,  wy - s.wy)  < 1.2))     continue;
+      this.groundTufts.push({
+        wx, wy,
+        type: Math.floor(Math.random() * 3), // 0 = dry grass, 1 = rocks, 2 = thorny shrub
+        size: 0.7 + Math.random() * 0.6,
+      });
     }
 
     // Grass patches — green spots scattered over the ochre ground
@@ -1078,12 +1163,28 @@ class GameScene extends Phaser.Scene {
     if (inZone >= 0) {
       this.activeZoneIdx = inZone;
       this.zoneHoldTimer += dt;
+      this.energy = Math.min(1.0, this.energy + ENERGY_REFILL_SPD * dt); // refill while anchoring
       if (this.zoneHoldTimer >= ZONE_HOLD_TIME) {
         this.zones[inZone].bloomed = true;
         this.score++;
         this.spiritGhostTimer = GHOST_TRAIL_DUR; // grant Speed Ghost trail
         this.zoneHoldTimer = 0;
         this.activeZoneIdx = -1;
+        // Wind gust burst from the newly-bloomed tree
+        const bz = this.zones[inZone];
+        for (let wi = 0; wi < 24; wi++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = 1.8 + Math.random() * 3.2;
+          const life  = 0.5 + Math.random() * 0.9;
+          this.particles.push({
+            wx: bz.wx + (Math.random() - 0.5) * bz.radius * 0.6,
+            wy: bz.wy + (Math.random() - 0.5) * bz.radius * 0.6,
+            vwx: Math.cos(angle) * speed,
+            vwy: Math.sin(angle) * speed,
+            life, maxLife: life,
+            wind: true,
+          });
+        }
         if (this.score >= this.pointsToWin && !this.portalActive) {
           this.portalActive = true;
         }
@@ -1094,7 +1195,7 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  // ── _drawPortal (Great Caraibeira) ───────────────────────────────────────────
+  // ── _drawPortal (Great Caraibeira — 2× scale, golden/white) ─────────────────
   _drawPortal() {
     this.portalGfx.clear();
     if (!this.portalActive) return;
@@ -1103,40 +1204,40 @@ class GameScene extends Phaser.Scene {
     const t = this.time.now / 1000;
     const pulse = 0.75 + 0.25 * Math.sin(t * 2.0);
 
-    // Ground aura (isometric ellipses)
-    this.portalGfx.fillStyle(0x00cc88, 0.07 * pulse);
-    this.portalGfx.fillEllipse(s.x, s.y, 280, 140);
-    this.portalGfx.fillStyle(0x22ffaa, 0.13 * pulse);
+    // Ground aura — golden rings (2× radius vs regular tree)
+    this.portalGfx.fillStyle(0xcc8800, 0.07 * pulse);
+    this.portalGfx.fillEllipse(s.x, s.y, 560, 280);
+    this.portalGfx.fillStyle(0xffcc22, 0.13 * pulse);
+    this.portalGfx.fillEllipse(s.x, s.y, 320, 160);
+    this.portalGfx.fillStyle(0xffffff, 0.22 * pulse);
     this.portalGfx.fillEllipse(s.x, s.y, 160, 80);
-    this.portalGfx.fillStyle(0x66ffcc, 0.22 * pulse);
-    this.portalGfx.fillEllipse(s.x, s.y, 80, 40);
 
-    // Entry ring — shows where player should walk
-    this.portalGfx.lineStyle(2, 0x44ffaa, 0.6 * pulse);
-    this.portalGfx.strokeEllipse(s.x, s.y, 128, 64);
+    // Entry ring — golden beacon, shows where player should walk
+    this.portalGfx.lineStyle(3, 0xffdd44, 0.75 * pulse);
+    this.portalGfx.strokeEllipse(s.x, s.y, 256, 128);
 
-    // Trunk — upward column of light
-    this.portalGfx.fillStyle(0x55ffcc, 0.65 * pulse);
-    this.portalGfx.fillRect(s.x - 5, s.y - 60, 10, 60);
-    this.portalGfx.fillStyle(0xaaffee, 0.80 * pulse);
-    this.portalGfx.fillRect(s.x - 3, s.y - 60, 6, 60);
+    // Trunk — 2× width and height, warm gold
+    this.portalGfx.fillStyle(0xffcc33, 0.65 * pulse);
+    this.portalGfx.fillRect(s.x - 10, s.y - 120, 20, 120);
+    this.portalGfx.fillStyle(0xffffff, 0.80 * pulse);
+    this.portalGfx.fillRect(s.x - 6,  s.y - 120, 12, 120);
 
-    // Canopy — layered ellipses rising above
-    this.portalGfx.fillStyle(0x33ffaa, 0.40 * pulse);
-    this.portalGfx.fillEllipse(s.x, s.y - 65, 100, 55);
-    this.portalGfx.fillStyle(0x66ffcc, 0.55 * pulse);
-    this.portalGfx.fillEllipse(s.x, s.y - 72, 64, 36);
-    this.portalGfx.fillStyle(0xaaffee, 0.75 * pulse);
-    this.portalGfx.fillEllipse(s.x, s.y - 80, 32, 18);
+    // Canopy — three layered tiers at 2× size, golden to white at top
+    this.portalGfx.fillStyle(0xffcc22, 0.40 * pulse);
+    this.portalGfx.fillEllipse(s.x, s.y - 130, 200, 110);
+    this.portalGfx.fillStyle(0xffee77, 0.55 * pulse);
+    this.portalGfx.fillEllipse(s.x, s.y - 144, 128,  72);
+    this.portalGfx.fillStyle(0xffffff, 0.80 * pulse);
+    this.portalGfx.fillEllipse(s.x, s.y - 160,  64,  36);
 
-    // Radiating branch lines from canopy centre
-    this.portalGfx.lineStyle(1.5, 0x66ffcc, 0.50 * pulse);
-    for (let i = 0; i < 6; i++) {
-      const a  = t * 0.5 + i * Math.PI / 3;
-      const r0 = 14, r1 = 32 + 7 * Math.sin(t * 2.5 + i);
+    // Radiating branch lines — 2× reach, golden
+    this.portalGfx.lineStyle(2, 0xffee66, 0.55 * pulse);
+    for (let i = 0; i < 8; i++) {
+      const a  = t * 0.4 + i * Math.PI / 4;
+      const r0 = 28, r1 = 64 + 14 * Math.sin(t * 2.5 + i);
       this.portalGfx.beginPath();
-      this.portalGfx.moveTo(s.x + Math.cos(a) * r0, s.y - 72 + Math.sin(a) * r0 * 0.45);
-      this.portalGfx.lineTo(s.x + Math.cos(a) * r1, s.y - 72 + Math.sin(a) * r1 * 0.45);
+      this.portalGfx.moveTo(s.x + Math.cos(a) * r0, s.y - 144 + Math.sin(a) * r0 * 0.45);
+      this.portalGfx.lineTo(s.x + Math.cos(a) * r1, s.y - 144 + Math.sin(a) * r1 * 0.45);
       this.portalGfx.strokePath();
     }
   }
@@ -1205,6 +1306,17 @@ class GameScene extends Phaser.Scene {
     this.hudGfx.fillRect(hbX, hbY, hbW * (hp / maxHp), hbH);
     this.hudGfx.lineStyle(1.5, 0xffffff, 0.5);
     this.hudGfx.strokeRect(hbX, hbY, hbW, hbH);
+
+    // ── Energy bar — top-right, below year text ───────────────────────────
+    const SW = this.scale.width;
+    const ebW = 120, ebH = 10, ebX = SW - 140, ebY = 60;
+    this.hudGfx.fillStyle(0x222222, 0.8);
+    this.hudGfx.fillRect(ebX, ebY, ebW, ebH);
+    const eColor = this.energy > 0.30 ? 0x44aaff : 0xff7722; // orange warning when low
+    this.hudGfx.fillStyle(eColor, 0.9);
+    this.hudGfx.fillRect(ebX, ebY, ebW * this.energy, ebH);
+    this.hudGfx.lineStyle(1.5, 0xffffff, 0.5);
+    this.hudGfx.strokeRect(ebX, ebY, ebW, ebH);
   }
 
   // ── _triggerLevelClear ───────────────────────────────────────────────────────
@@ -1214,22 +1326,28 @@ class GameScene extends Phaser.Scene {
     this.dead = true;
     this.vx = 0; this.vy = 0;
 
-    const nextYear = this.currentYear + 2;
+    const nextYear = this.currentYear + 1; // successful preservation — only +1 year
     const w = this.scale.width, h = this.scale.height;
     const font = 'Arial, Helvetica, sans-serif';
 
-    // White overlay tweened in — avoids camera.fade() which occludes depth-200+ objects
-    const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0xffffff)
+    // White fade-to-light — the Sanctuary welcomes the spirit
+    const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0xfff8e0)
       .setScrollFactor(0).setDepth(200).setAlpha(0);
 
-    const msg = this.add.text(w / 2, h / 2,
-      `The Spirit is strengthened.\nThe year is now ${nextYear}.`, {
-        fontFamily: font, fontSize: '34px', color: '#1a2010',
-        stroke: '#f0f0f0', strokeThickness: 2, align: 'center',
+    const headline = this.add.text(w / 2, h / 2 - 48,
+      'The Legacy Continues', {
+        fontFamily: font, fontSize: '52px', color: '#3a2400',
+        stroke: '#fff8e0', strokeThickness: 3, align: 'center',
       }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
 
-    this.tweens.add({ targets: overlay, alpha: 1, duration: 1800 });
-    this.tweens.add({ targets: msg,    alpha: 1, duration: 1100, delay: 1600 });
+    const sub = this.add.text(w / 2, h / 2 + 20,
+      `The spirit has marked the path.\nThe year advances to ${nextYear}.`, {
+        fontFamily: font, fontSize: '22px', color: '#5a3a00',
+        stroke: '#fff8e0', strokeThickness: 2, align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+    this.tweens.add({ targets: overlay,             alpha: 1, duration: 1800 });
+    this.tweens.add({ targets: [headline, sub],     alpha: 1, duration: 1000, delay: 1500 });
     this.time.delayedCall(6000, () => this.scene.restart({ year: nextYear }));
   }
 
@@ -1239,29 +1357,66 @@ class GameScene extends Phaser.Scene {
     this.dead = true;
     this.vx = 0; this.vy = 0;
 
-    const nextYear = this.currentYear + 10;
+    const nextYear = this.currentYear + 2; // each failure costs 2 years (one generation)
     const w = this.scale.width, h = this.scale.height;
     const font = 'Arial, Helvetica, sans-serif';
 
     this.cameras.main.shake(200, 0.025);
 
+    // ── EXTINCTION — year has reached 2000 ───────────────────────────────
+    if (nextYear >= 2000) {
+      const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0x000000)
+        .setScrollFactor(0).setDepth(200).setAlpha(0);
+
+      const headline = this.add.text(w / 2, h / 2 - 60,
+        'EXTINCTION', {
+          fontFamily: font, fontSize: '72px', color: '#cc2200',
+          stroke: '#000000', strokeThickness: 6, align: 'center',
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+      const flavour = this.add.text(w / 2, h / 2 + 14,
+        `The year 2000 has arrived.\nThe last Spix's Macaw falls silent.\nThe jungle remembers only the echo of wings.`, {
+          fontFamily: font, fontSize: '22px', color: '#aabbcc',
+          stroke: '#000000', strokeThickness: 3, align: 'center',
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+      const sub = this.add.text(w / 2, h / 2 + 110,
+        'Press SPACE to begin again.', {
+          fontFamily: font, fontSize: '16px', color: '#666688',
+          stroke: '#000000', strokeThickness: 2, align: 'center',
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
+
+      this.tweens.add({ targets: overlay,            alpha: 1, duration: 1600, delay: 200 });
+      this.tweens.add({ targets: [headline, flavour], alpha: 1, duration: 900,  delay: 1200 });
+      this.tweens.add({ targets: sub,                alpha: 1, duration: 700,  delay: 2400 });
+
+      // Restart from 1987 on SPACE
+      this.time.delayedCall(1600, () => {
+        this.input.keyboard.once('keydown-SPACE', () => {
+          this.scene.restart({ year: 1987 });
+        });
+      });
+      return;
+    }
+
+    // ── GENERATION LOST — year < 2000 after penalty ───────────────────────
     // Black overlay tweened in — avoids camera.fade() which occludes depth-200+ objects
     const overlay = this.add.rectangle(w / 2, h / 2, w, h, 0x000000)
       .setScrollFactor(0).setDepth(200).setAlpha(0);
 
-    const headline = this.add.text(w / 2, h / 2 - 44,
-      `${this.currentYear}: A lineage lost.`, {
-        fontFamily: font, fontSize: '46px', color: '#ffffff',
-        stroke: '#000000', strokeThickness: 4, align: 'center',
+    const headline = this.add.text(w / 2, h / 2 - 54,
+      'Generation Lost', {
+        fontFamily: font, fontSize: '54px', color: '#ffffff',
+        stroke: '#000000', strokeThickness: 5, align: 'center',
       }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
 
-    const flavour = this.add.text(w / 2, h / 2 + 18,
-      'Years pass in silence. The spirit returns...', {
+    const flavour = this.add.text(w / 2, h / 2 + 14,
+      `The clock jumps to ${nextYear}.\nThe spirit endures — but time runs short.`, {
         fontFamily: font, fontSize: '22px', color: '#aabbcc',
         stroke: '#000000', strokeThickness: 3, align: 'center',
       }).setOrigin(0.5).setScrollFactor(0).setDepth(201).setAlpha(0);
 
-    const sub = this.add.text(w / 2, h / 2 + 60,
+    const sub = this.add.text(w / 2, h / 2 + 80,
       'Press SPACE to return as the next generation.', {
         fontFamily: font, fontSize: '16px', color: '#666688',
         stroke: '#000000', strokeThickness: 2, align: 'center',
@@ -1313,6 +1468,45 @@ class GameScene extends Phaser.Scene {
   // ── _drawAncestralCall ────────────────────────────────────────────────────────
   _drawAncestralCall() {
     this.revealGfx.clear();
+
+    // ── Wind gust burst particles (above fog, from bloomed trees) ──
+    for (const p of this.particles) {
+      if (!p.wind) continue;
+      const ps   = toScreen(p.wx, p.wy);
+      const frac = p.life / p.maxLife;
+      this.revealGfx.fillStyle(0x55ffcc, frac * 0.9);
+      this.revealGfx.fillCircle(ps.x, ps.y, 5 * frac + 2);
+      this.revealGfx.fillStyle(0xffffff, frac * 0.5);
+      this.revealGfx.fillCircle(ps.x, ps.y, 2.2 * frac);
+    }
+
+    // ── Spirit Path — animated flowing dots from player toward Sanctuary ──
+    if (this.portalActive && !this.levelClearing) {
+      const playerS = toScreen(this.wx, this.wy);
+      const sanctS  = toScreen(0, 0);
+      const dxS = sanctS.x - playerS.x;
+      const dyS = sanctS.y - playerS.y;
+      const pathLen = Math.hypot(dxS, dyS);
+      if (pathLen > 20) {
+        const t = this.time.now / 1000;
+        const steps = Math.floor(pathLen / 16);
+        for (let i = 1; i < steps; i++) {
+          const frac  = i / steps;
+          // Animate: offset phase over time for flowing "marching dots" effect
+          const phase = (frac - t * 0.28 + 20) % 1.0;
+          if (phase > 0.42) continue; // gap between dashes
+          const px = playerS.x + dxS * frac;
+          const py = playerS.y + dyS * frac;
+          const r  = 3.5 * (1 - frac * 0.55);        // taper toward sanctuary
+          const a  = ((0.42 - phase) / 0.42) * 0.75;  // fade toward tip
+          this.revealGfx.fillStyle(0x44aaff, a);
+          this.revealGfx.fillCircle(px, py, r);
+        }
+        // Bright dot at sanctuary end
+        this.revealGfx.fillStyle(0xffffff, 0.7 + 0.3 * Math.abs(Math.sin(this.time.now / 300)));
+        this.revealGfx.fillCircle(sanctS.x, sanctS.y, 6);
+      }
+    }
 
     // ── Expanding ripple rings (drawn in world space, above fog) ──
     for (const rip of this.ancestralRipples) {
@@ -1371,22 +1565,6 @@ class GameScene extends Phaser.Scene {
     this.add.image(0, 0, 'fog').setOrigin(0, 0).setScrollFactor(0).setDepth(50);
   }
 
-  // ── _makeTex ─────────────────────────────────────────────────────────────────
-  _makeTex(key, fillColor, lineColor) {
-    const g = this.make.graphics({ add: false });
-    g.fillStyle(fillColor, 1);
-    g.beginPath();
-    g.moveTo(TILE_W / 2, 0);
-    g.lineTo(TILE_W,     TILE_H / 2);
-    g.lineTo(TILE_W / 2, TILE_H);
-    g.lineTo(0,          TILE_H / 2);
-    g.closePath();
-    g.fillPath();
-    g.lineStyle(1, lineColor, 0.5);
-    g.strokePath();
-    g.generateTexture(key, TILE_W, TILE_H);
-    g.destroy();
-  }
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
