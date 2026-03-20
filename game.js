@@ -82,7 +82,8 @@ class GameScene extends Phaser.Scene {
     // Graphics layers (depth order matters)
     this.grassGfx  = this.add.graphics().setDepth(0.5);
     this.tuftGfx   = this.add.graphics().setDepth(0.55); // ground tufts, above grass, below trees
-    this.zoneGfx   = this.add.graphics().setDepth(1);
+    this.trunkGfx  = this.add.graphics().setDepth(1);
+    this.canopyGfx = this.add.graphics().setDepth(7);
     this.portalGfx = this.add.graphics().setDepth(1.5);
     this.trapGfx   = this.add.graphics().setDepth(0.7);
     this.trailGfx  = this.add.graphics().setDepth(3);
@@ -231,54 +232,27 @@ class GameScene extends Phaser.Scene {
     this.cameras.main.centerOn(s.x, s.y);
 
     // ── Y-sort depth: entity depth is determined by isoY position vs each tree ──
-    // Trees on zoneGfx (depth 1) occlude entities with depth < 1.
-    // Default = in front of trees; drops to 0.5/0.6 when entity's isoY < tree's isoY.
-    const pIsoY  = this.wx + this.wy;
-    const rIsoY  = this.reaper.wx + this.reaper.wy;
-    let pd = 6, sd = 5.9, td = 5.8, ed = 5.5;
+    // Trunks on trunkGfx (depth 1), canopies on canopyGfx (depth 7).
 
-    // ── Large Caraibeira zones ──
-    for (const z of this.zones) {
-      const zIsoY = z.wx + z.wy;
-      if (pd > 1 && pIsoY < zIsoY &&
-          Math.hypot(this.wx - z.wx, this.wy - z.wy) < z.radius * 2.5)
-        { pd = 0.5; sd = 0.4; td = 0.3; }
-      if (ed > 1 && rIsoY < zIsoY &&
-          Math.hypot(this.reaper.wx - z.wx, this.reaper.wy - z.wy) < z.radius * 2.0)
-        { ed = 0.6; }
-      if (ed > 1) {
-        for (const p of this.poachers) {
-          if (p.wx + p.wy < zIsoY &&
+    // Enemy depth — occlude behind large Caraibeira zones
+    if (this.reaper) {
+      const rIsoY = this.reaper.wx + this.reaper.wy;
+      let ed = 5.5;
+      for (const z of this.zones) {
+        if (rIsoY < z.wx + z.wy &&
+            Math.hypot(this.reaper.wx - z.wx, this.reaper.wy - z.wy) < z.radius * 2.0)
+          { ed = 0.6; break; }
+      }
+      for (const p of this.poachers) {
+        if (ed <= 0.6) break; // already occluded
+        for (const z of this.zones) {
+          if (p.wx + p.wy < z.wx + z.wy &&
               Math.hypot(p.wx - z.wx, p.wy - z.wy) < z.radius * 2.0)
             { ed = 0.6; break; }
         }
       }
+      this.enemyGfx.setDepth(ed);
     }
-
-    // ── Saplings occlude player AND enemies (not just player) ──
-    for (const sp of this.saplings) {
-      if (pd <= 0.6 && ed <= 0.7) break; // both already occluded — early exit
-      const spIsoY = sp.wx + sp.wy;
-      const spR    = sp.trunkR * 4.5;
-      if (pd > 1 && pIsoY < spIsoY &&
-          Math.hypot(this.wx - sp.wx, this.wy - sp.wy) < spR)
-        { pd = 0.5; sd = 0.4; td = 0.3; }
-      if (ed > 1 && rIsoY < spIsoY &&
-          Math.hypot(this.reaper.wx - sp.wx, this.reaper.wy - sp.wy) < spR)
-        { ed = 0.6; }
-      if (ed > 1) {
-        for (const p of this.poachers) {
-          if (p.wx + p.wy < spIsoY &&
-              Math.hypot(p.wx - sp.wx, p.wy - sp.wy) < spR)
-            { ed = 0.6; break; }
-        }
-      }
-    }
-
-    this.playerGfx.setDepth(pd);
-    this.shadowGfx.setDepth(sd);
-    this.trailGfx.setDepth(td);
-    this.enemyGfx.setDepth(ed);
   }
 
   // ── _move ────────────────────────────────────────────────────────────────────
@@ -768,7 +742,8 @@ class GameScene extends Phaser.Scene {
 
   // ── _drawZones ───────────────────────────────────────────────────────────────
   _drawZones() {
-    this.zoneGfx.clear();
+    this.trunkGfx.clear();
+    this.canopyGfx.clear();
     const time = this.time.now / 1000;
     const cam  = toScreen(this.wx, this.wy);
 
@@ -786,24 +761,22 @@ class GameScene extends Phaser.Scene {
     }
     list.sort((a, b) => a.isoY - b.isoY); // ascending isoY = further back = draw first
 
-    const g = this.zoneGfx;
+    const gt = this.trunkGfx;  // trunks and ground auras
+    const gc = this.canopyGfx; // canopy ellipses only
 
     for (const { kind, obj, s } of list) {
       if (kind === 'sapling') {
-        // Type 0 = 90% of Caraibeira, Type 1 = 80% of Caraibeira
         const f = obj.type === 0 ? 0.9 : 0.8;
-        // Trunk
-        g.fillStyle(0x3a1e08, 1);
-        g.fillRect(s.x - Math.round(10 * f), s.y - Math.round(136 * f), Math.round(20 * f), Math.round(132 * f));
-        // Lower canopy
-        g.fillStyle(0x1a6622, 0.94);
-        g.fillEllipse(s.x, s.y - Math.round(144 * f), Math.round(188 * f), Math.round(94 * f));
-        // Mid canopy
-        g.fillStyle(0x2d8834, 0.97);
-        g.fillEllipse(s.x, s.y - Math.round(200 * f), Math.round(140 * f), Math.round(70 * f));
-        // Top canopy
-        g.fillStyle(0x56bb44, 1.0);
-        g.fillEllipse(s.x, s.y - Math.round(244 * f), Math.round(88 * f), Math.round(44 * f));
+        // Trunk — draws to trunkGfx
+        gt.fillStyle(0x3a1e08, 1);
+        gt.fillRect(s.x - Math.round(10 * f), s.y - Math.round(136 * f), Math.round(20 * f), Math.round(132 * f));
+        // Canopy — draws to canopyGfx
+        gc.fillStyle(0x1a6622, 0.94);
+        gc.fillEllipse(s.x, s.y - Math.round(144 * f), Math.round(188 * f), Math.round(94 * f));
+        gc.fillStyle(0x2d8834, 0.97);
+        gc.fillEllipse(s.x, s.y - Math.round(200 * f), Math.round(140 * f), Math.round(70 * f));
+        gc.fillStyle(0x56bb44, 1.0);
+        gc.fillEllipse(s.x, s.y - Math.round(244 * f), Math.round(88 * f), Math.round(44 * f));
         continue;
       }
 
@@ -815,44 +788,44 @@ class GameScene extends Phaser.Scene {
         ? 0.70 + 0.30 * Math.sin(time * 2.5 + z.phase)
         : 0.60 + 0.40 * Math.sin(time * 1.8 + z.phase);
 
-      // Ground aura
+      // Ground aura — trunkGfx
       if (z.bloomed) {
-        g.fillStyle(0x00ffcc, 0.05 * pulse);
-        g.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
-        g.fillStyle(0x44ffdd, 0.10 * pulse);
-        g.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
-        g.lineStyle(1.5, 0x44ffcc, 0.55 * pulse);
-        g.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
+        gt.fillStyle(0x00ffcc, 0.05 * pulse);
+        gt.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
+        gt.fillStyle(0x44ffdd, 0.10 * pulse);
+        gt.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
+        gt.lineStyle(1.5, 0x44ffcc, 0.55 * pulse);
+        gt.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
       } else {
-        g.fillStyle(0x44ff66, 0.04 * pulse);
-        g.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
-        g.fillStyle(0x66ff88, 0.08 * pulse);
-        g.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
-        g.lineStyle(1, 0x66ff88, 0.30 * pulse);
-        g.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
+        gt.fillStyle(0x44ff66, 0.04 * pulse);
+        gt.fillEllipse(s.x, s.y, rw * 2.2, rh * 2.2);
+        gt.fillStyle(0x66ff88, 0.08 * pulse);
+        gt.fillEllipse(s.x, s.y, rw * 1.3, rh * 1.3);
+        gt.lineStyle(1, 0x66ff88, 0.30 * pulse);
+        gt.strokeEllipse(s.x, s.y, rw * 1.8, rh * 1.8);
       }
 
-      // Trunk — 2× width and height
-      g.fillStyle(0x3a1e08, 1);
-      g.fillRect(s.x - 10, s.y - 136, 20, 132);
+      // Trunk — trunkGfx
+      gt.fillStyle(0x3a1e08, 1);
+      gt.fillRect(s.x - 10, s.y - 136, 20, 132);
 
-      // Canopy — three tiers at 2× size and height
+      // Canopy — canopyGfx
       if (z.bloomed) {
-        g.fillStyle(0x1aaa66, 0.95);
-        g.fillEllipse(s.x, s.y - 144, 188, 94);
-        g.fillStyle(0x33ddaa, 0.97);
-        g.fillEllipse(s.x, s.y - 200, 140, 70);
-        g.fillStyle(0x77ffcc, 1.0);
-        g.fillEllipse(s.x, s.y - 244, 88, 44);
-        g.lineStyle(1.5, 0xaaffee, 0.6 * pulse);
-        g.strokeEllipse(s.x, s.y - 200, 140, 70);
+        gc.fillStyle(0x1aaa66, 0.95);
+        gc.fillEllipse(s.x, s.y - 144, 188, 94);
+        gc.fillStyle(0x33ddaa, 0.97);
+        gc.fillEllipse(s.x, s.y - 200, 140, 70);
+        gc.fillStyle(0x77ffcc, 1.0);
+        gc.fillEllipse(s.x, s.y - 244, 88, 44);
+        gc.lineStyle(1.5, 0xaaffee, 0.6 * pulse);
+        gc.strokeEllipse(s.x, s.y - 200, 140, 70);
       } else {
-        g.fillStyle(0x1a6622, 0.94);
-        g.fillEllipse(s.x, s.y - 144, 188, 94);
-        g.fillStyle(0x2d8834, 0.97);
-        g.fillEllipse(s.x, s.y - 200, 140, 70);
-        g.fillStyle(0x56bb44, 1.0);
-        g.fillEllipse(s.x, s.y - 244, 88, 44);
+        gc.fillStyle(0x1a6622, 0.94);
+        gc.fillEllipse(s.x, s.y - 144, 188, 94);
+        gc.fillStyle(0x2d8834, 0.97);
+        gc.fillEllipse(s.x, s.y - 200, 140, 70);
+        gc.fillStyle(0x56bb44, 1.0);
+        gc.fillEllipse(s.x, s.y - 244, 88, 44);
       }
     }
   }
@@ -991,6 +964,10 @@ class GameScene extends Phaser.Scene {
 
   // ── _drawPlayer ──────────────────────────────────────────────────────────────
   _drawPlayer() {
+    // Dynamic depth: bird sorts between trunks (depth 1) and canopies (depth 7)
+    const isoY = this.wx + this.wy;
+    this.playerGfx.setDepth(5 + (isoY + WORLD_SPAN) / (WORLD_SPAN * 2));
+
     const s   = toScreen(this.wx, this.wy);
     const SZ  = 20;
     const fsx = this.fx - this.fy;
