@@ -1379,13 +1379,13 @@ class GameScene extends Phaser.Scene {
       this.hudGfx.fillRect(ebX, ebY, fillW, ebH);
       this.hudGfx.fillStyle(0xa8e040, 0.55);
       this.hudGfx.fillRect(ebX, ebY, fillW, Math.ceil(ebH * 0.45));
+      // Shimmer line — only on green fill state
+      this.hudGfx.fillStyle(0xb4ff50, 0.4);
+      this.hudGfx.fillRect(ebX, ebY, fillW, 2);
     } else {
       this.hudGfx.fillStyle(0xff7722, 0.9);
       this.hudGfx.fillRect(ebX, ebY, fillW, ebH);
     }
-    // Shimmer line at top of fill
-    this.hudGfx.fillStyle(0xb4ff50, 0.4);
-    this.hudGfx.fillRect(ebX, ebY, fillW, 2);
     // Bark border
     this._barkBorder(this.hudGfx, ebX - 2, ebY - 2, ebW + 4, ebH + 4, 0x8a6830);
     // Position 'SPIRIT ENERGY' label 10px above the bar
