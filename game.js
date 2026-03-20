@@ -765,6 +765,12 @@ class GameScene extends Phaser.Scene {
     const gc = this.canopyGfx; // canopy ellipses only
 
     for (const { kind, obj, s } of list) {
+      // Per-tree wind sway — canopy only; phase field exists on both zones and saplings
+      const phase      = obj.phase ?? 0;
+      const swayAmp    = kind === 'zone' ? 2.5 : 1.2;
+      const swayX      = Math.sin(time * 0.65 + phase) * swayAmp;
+      const swayScaleW = 1 + 0.018 * Math.sin(time * 0.9 + phase);
+
       if (kind === 'sapling') {
         const f = obj.type === 0 ? 0.9 : 0.8;
         // Trunk — draws to trunkGfx
@@ -772,11 +778,11 @@ class GameScene extends Phaser.Scene {
         gt.fillRect(s.x - Math.round(10 * f), s.y - Math.round(136 * f), Math.round(20 * f), Math.round(132 * f));
         // Canopy — draws to canopyGfx
         gc.fillStyle(0x1a6622, 0.94);
-        gc.fillEllipse(s.x, s.y - Math.round(144 * f), Math.round(188 * f), Math.round(94 * f));
+        gc.fillEllipse(s.x + swayX, s.y - Math.round(144 * f), Math.round(188 * f) * swayScaleW, Math.round(94 * f));
         gc.fillStyle(0x2d8834, 0.97);
-        gc.fillEllipse(s.x, s.y - Math.round(200 * f), Math.round(140 * f), Math.round(70 * f));
+        gc.fillEllipse(s.x + swayX, s.y - Math.round(200 * f), Math.round(140 * f) * swayScaleW, Math.round(70 * f));
         gc.fillStyle(0x56bb44, 1.0);
-        gc.fillEllipse(s.x, s.y - Math.round(244 * f), Math.round(88 * f), Math.round(44 * f));
+        gc.fillEllipse(s.x + swayX, s.y - Math.round(244 * f), Math.round(88 * f) * swayScaleW, Math.round(44 * f));
         continue;
       }
 
@@ -812,20 +818,20 @@ class GameScene extends Phaser.Scene {
       // Canopy — canopyGfx
       if (z.bloomed) {
         gc.fillStyle(0x1aaa66, 0.95);
-        gc.fillEllipse(s.x, s.y - 144, 188, 94);
+        gc.fillEllipse(s.x + swayX, s.y - 144, 188 * swayScaleW, 94);
         gc.fillStyle(0x33ddaa, 0.97);
-        gc.fillEllipse(s.x, s.y - 200, 140, 70);
+        gc.fillEllipse(s.x + swayX, s.y - 200, 140 * swayScaleW, 70);
         gc.fillStyle(0x77ffcc, 1.0);
-        gc.fillEllipse(s.x, s.y - 244, 88, 44);
+        gc.fillEllipse(s.x + swayX, s.y - 244, 88 * swayScaleW, 44);
         gc.lineStyle(1.5, 0xaaffee, 0.6 * pulse);
-        gc.strokeEllipse(s.x, s.y - 200, 140, 70);
+        gc.strokeEllipse(s.x + swayX, s.y - 200, 140 * swayScaleW, 70);
       } else {
         gc.fillStyle(0x1a6622, 0.94);
-        gc.fillEllipse(s.x, s.y - 144, 188, 94);
+        gc.fillEllipse(s.x + swayX, s.y - 144, 188 * swayScaleW, 94);
         gc.fillStyle(0x2d8834, 0.97);
-        gc.fillEllipse(s.x, s.y - 200, 140, 70);
+        gc.fillEllipse(s.x + swayX, s.y - 200, 140 * swayScaleW, 70);
         gc.fillStyle(0x56bb44, 1.0);
-        gc.fillEllipse(s.x, s.y - 244, 88, 44);
+        gc.fillEllipse(s.x + swayX, s.y - 244, 88 * swayScaleW, 44);
       }
     }
   }
