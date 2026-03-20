@@ -966,7 +966,8 @@ class GameScene extends Phaser.Scene {
   _drawPlayer() {
     // Dynamic depth: bird sorts between trunks (depth 1) and canopies (depth 7)
     const isoY = this.wx + this.wy;
-    this.playerGfx.setDepth(5 + (isoY + WORLD_SPAN) / (WORLD_SPAN * 2));
+    this.playerGfx.setDepth(5 + (isoY + WORLD_SPAN) / (WORLD_SPAN * 4));
+    this.trailGfx.setDepth(this.playerGfx.depth - 0.15);
 
     const s   = toScreen(this.wx, this.wy);
     const SZ  = 20;
