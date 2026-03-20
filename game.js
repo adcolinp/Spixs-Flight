@@ -23,7 +23,7 @@ const ZONE_R         = 2.58;   // Caraibeira zone radius — 20% smaller than or
 const ZONE_TRUNK_R   = 0.45;   // visual/depth-sort trunk radius (world units)
 const ZONE_COL_R     = 0.14;   // collision-only radius — just the physical trunk base
 const NUM_TRAPS      = 22;
-const NUM_SAPLINGS   = 150;    // dense Caatinga; min-distance check keeps it organic
+const NUM_SAPLINGS   = 300;    // dense Caatinga; min-distance check keeps it organic
 const NUM_TUFTS      = 62;     // 250% of original 25 — rich ground detail
 const WORLD_SPAN     = 27;     // 50% larger than original 18 — fits 3600×2700 bounds
 
@@ -53,6 +53,16 @@ const MATE_FADE  = 2.2;   // seconds for spiral-out
 // ─── Isometric projection ─────────────────────────────────────────────────────
 function toScreen(wx, wy) {
   return { x: (wx - wy) * 64, y: (wx + wy) * 32 };
+}
+
+// Blend two packed hex colours by factor t (0=base, 1=tint)
+function blendHex(base, tint, t) {
+  const br = (base >> 16) & 0xff, bg = (base >> 8) & 0xff, bb = base & 0xff;
+  const tr = (tint >> 16) & 0xff, tg = (tint >> 8) & 0xff, tb = tint & 0xff;
+  const r = Math.round(br + (tr - br) * t);
+  const g = Math.round(bg + (tg - bg) * t);
+  const b = Math.round(bb + (tb - bb) * t);
+  return (r << 16) | (g << 8) | b;
 }
 
 // ─── Scene ────────────────────────────────────────────────────────────────────
@@ -92,6 +102,7 @@ class GameScene extends Phaser.Scene {
     this.dashCD    = 0;
     this.ddx = 0; this.ddy = 0;
     this.dead = false;
+    this.orbitRadius = null; // null = not in orbit; set to current dist on zone entry
 
     // ── Mate ────────────────────────────────────────────────────────────────
     this.mateActive    = false;
@@ -270,6 +281,7 @@ class GameScene extends Phaser.Scene {
   // ── _move ────────────────────────────────────────────────────────────────────
   _move(dt) {
     const k = this.keys;
+    let kineticMove = false; // set true when position is placed directly (skip vx/vy integration)
 
     // WASD → isometric screen directions
     // W=screen-up(-1,-1)  S=screen-down(+1,+1)
@@ -328,28 +340,42 @@ class GameScene extends Phaser.Scene {
           : null;
 
         if (orbitZone) {
-          // Orbital glide: kinematically locked to 50% of zone radius centred on the tree.
-          // Position is set directly — no velocity drift can push the bird out.
-          const orbitR = orbitZone.radius * 0.50;
+          // Orbital glide: smoothly pulls the bird onto a circle at 50% zone radius.
+          const targetR = orbitZone.radius * 0.50;
 
-          // Derive current angle from tree centre, then advance by one frame
+          // On first frame inside zone, seed orbitRadius from current distance
           const odx = this.wx - orbitZone.wx;
           const ody = this.wy - orbitZone.wy;
+          const curDist = Math.hypot(odx, ody) || targetR;
+          if (this.orbitRadius === null) this.orbitRadius = curDist;
+
+          // Lerp radius toward target (~1.5 s to settle)
+          this.orbitRadius += (targetR - this.orbitRadius) * Math.min(1, dt * 2.5);
+
+          // Advance angle from current position, then place bird at blended radius
           this.glideAngle = Math.atan2(ody, odx) + GLIDE_TURN_SPD * dt;
+          this.wx = orbitZone.wx + Math.cos(this.glideAngle) * this.orbitRadius;
+          this.wy = orbitZone.wy + Math.sin(this.glideAngle) * this.orbitRadius;
 
-          // Directly place bird on the orbit ring (anchor timer will never be interrupted)
-          const prevWx = this.wx, prevWy = this.wy;
-          this.wx = orbitZone.wx + Math.cos(this.glideAngle) * orbitR;
-          this.wy = orbitZone.wy + Math.sin(this.glideAngle) * orbitR;
+          // Tangent velocity for dash/particles; no integration step needed
+          const tangX = -Math.sin(this.glideAngle);
+          const tangY =  Math.cos(this.glideAngle);
+          const orbitSpd = this.orbitRadius * GLIDE_TURN_SPD;
+          this.vx = tangX * orbitSpd;
+          this.vy = tangY * orbitSpd;
 
-          // Derive velocity from the displacement so dash/particles stay consistent
-          this.vx = (this.wx - prevWx) / dt;
-          this.vy = (this.wy - prevWy) / dt;
+          // Smoothly steer facing toward tangent direction
+          const fl = 1 - Math.pow(0.001, dt * 4);
+          this.fx += (tangX - this.fx) * fl;
+          this.fy += (tangY - this.fy) * fl;
+          const fn = Math.hypot(this.fx, this.fy);
+          if (fn > 0) { this.fx /= fn; this.fy /= fn; }
 
-          // Facing = tangent direction of the circle
-          const sp2 = Math.hypot(this.vx, this.vy);
-          if (sp2 > 0.01) { this.fx = this.vx / sp2; this.fy = this.vy / sp2; }
+          kineticMove = true;
         } else {
+          // Leaving or outside all zones — reset orbit state
+          this.orbitRadius = null;
+
           // Free thermal glide: wide lazy circle with no input
           this.glideAngle += GLIDE_TURN_SPD * dt;
           const gx = Math.cos(this.glideAngle);
@@ -367,8 +393,10 @@ class GameScene extends Phaser.Scene {
       if (sp > maxSp) { this.vx *= maxSp / sp; this.vy *= maxSp / sp; }
     }
 
-    this.wx += this.vx * dt;
-    this.wy += this.vy * dt;
+    if (!kineticMove) {
+      this.wx += this.vx * dt;
+      this.wy += this.vy * dt;
+    }
 
     // Clamp to world bounds (3600×2700 screen pixels centred on origin)
     const ps = toScreen(this.wx, this.wy);
@@ -711,24 +739,25 @@ class GameScene extends Phaser.Scene {
     for (const t of this.groundTufts) {
       const s = toScreen(t.wx, t.wy);
       if (Math.abs(s.x - cam.x) > 900 || Math.abs(s.y - cam.y) > 600) continue;
-      const sz = t.size * 33; // 50% larger than original 22
+      const sz = t.size * 33;
+      const T  = 0.18;
       if (t.type === 0) {
-        // Dry grass tuft — yellow-brown layered ovals
-        this.tuftGfx.fillStyle(0x7a5c14, 0.85);
+        // Dry grass tuft
+        this.tuftGfx.fillStyle(blendHex(0x7a5c14, t.tint, T), 0.85);
         this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.5, sz * 0.55);
-        this.tuftGfx.fillStyle(0xa87c28, 0.55);
+        this.tuftGfx.fillStyle(blendHex(0xa87c28, t.tint, T), 0.55);
         this.tuftGfx.fillEllipse(s.x - sz * 0.2, s.y - sz * 0.12, sz * 0.75, sz * 0.28);
       } else if (t.type === 1) {
-        // Rock cluster — warm gray rounded shapes
-        this.tuftGfx.fillStyle(0x848078, 0.82);
+        // Rock cluster
+        this.tuftGfx.fillStyle(blendHex(0x848078, t.tint, T), 0.82);
         this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.3, sz * 0.50);
-        this.tuftGfx.fillStyle(0xaaa89a, 0.48);
+        this.tuftGfx.fillStyle(blendHex(0xaaa89a, t.tint, T), 0.48);
         this.tuftGfx.fillEllipse(s.x - sz * 0.28, s.y - sz * 0.14, sz * 0.62, sz * 0.24);
       } else {
-        // Thorny shrub — dark brownish-green Caatinga brush
-        this.tuftGfx.fillStyle(0x3e3010, 0.90);
+        // Thorny shrub
+        this.tuftGfx.fillStyle(blendHex(0x3e3010, t.tint, T), 0.90);
         this.tuftGfx.fillEllipse(s.x, s.y, sz * 1.1, sz * 0.44);
-        this.tuftGfx.fillStyle(0x5a4418, 0.55);
+        this.tuftGfx.fillStyle(blendHex(0x5a4418, t.tint, T), 0.55);
         this.tuftGfx.fillEllipse(s.x, s.y - sz * 0.13, sz * 0.72, sz * 0.30);
       }
     }
@@ -1070,6 +1099,7 @@ class GameScene extends Phaser.Scene {
     // Ground tufts — decorative Caatinga details (dry grass, rocks, shrubs); NO hitbox
     this.groundTufts = [];
     tries = 0;
+    const EARTHY_TINTS = [0x4a7c3f, 0xc4a882, 0xc4703f]; // Moss, Dust, Dry Clay
     while (this.groundTufts.length < NUM_TUFTS && tries++ < 2000) {
       const wx = (Math.random() - 0.5) * WORLD_SPAN * 2;
       const wy = (Math.random() - 0.5) * WORLD_SPAN * 2;
@@ -1081,6 +1111,7 @@ class GameScene extends Phaser.Scene {
         wx, wy,
         type: Math.floor(Math.random() * 3), // 0 = dry grass, 1 = rocks, 2 = thorny shrub
         size: 0.7 + Math.random() * 0.6,
+        tint: EARTHY_TINTS[Math.floor(Math.random() * 3)],
       });
     }
 
