@@ -169,17 +169,20 @@ class GameScene extends Phaser.Scene {
       stroke: '#000000', strokeThickness: 3,
     }).setOrigin(0, 0).setScrollFactor(0).setDepth(100);
 
-    // Current Year — top-right corner
-    this.yearText = this.add.text(HW - 20, 16, '', {
-      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '18px', color: '#ffffff',
-      stroke: '#000000', strokeThickness: 3,
-    }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
+    // 'YEAR' label inside bark box — top-right corner
+    this.yearText = this.add.text(0, 0, 'YEAR', {
+      fontFamily: 'monospace', fontSize: '7px', color: '#786028',
+    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100);
 
-    // Energy label — below year (bar drawn in _drawHUD via hudGfx)
-    this.energyLabel = this.add.text(HW - 20, 44, 'Energy', {
-      fontFamily: 'Arial, Helvetica, sans-serif', fontSize: '12px', color: '#88ccff',
-      stroke: '#000000', strokeThickness: 2,
-    }).setOrigin(1, 0).setScrollFactor(0).setDepth(100);
+    // Year numeral — updated each frame in _drawHUD
+    this.yearNumText = this.add.text(0, 0, '1987', {
+      fontFamily: 'monospace', fontSize: '13px', fontStyle: 'bold', color: '#d4a840',
+    }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(100);
+
+    // 'SPIRIT ENERGY' label above energy bar — positioned each frame in _drawHUD
+    this.energyLabel = this.add.text(0, 0, 'SPIRIT ENERGY', {
+      fontFamily: 'monospace', fontSize: '7px', color: '#8a6830',
+    }).setOrigin(0, 1).setScrollFactor(0).setDepth(100);
 
     // Health label (bar is drawn in _drawHUD via hudGfx)
     this.healthLabel = this.add.text(20, 44, 'Health', {
@@ -1273,6 +1276,26 @@ class GameScene extends Phaser.Scene {
     }
   }
 
+  // Draws an organic pixel-notch border around a rectangle.
+  // gfx: Phaser.Graphics | x,y,w,h: box coords | col: packed hex color
+  _barkBorder(gfx, x, y, w, h, col) {
+    const notch = [3, 1, 3, 2, 2, 1, 3, 1, 2, 3, 1, 2];
+    let ni = 0;
+    gfx.fillStyle(col, 1);
+    for (let i = x; i < x + w; i++) {
+      const n = notch[ni++ % notch.length];
+      const ext = (i % n === 0) ? 2 : 1;
+      gfx.fillRect(i, y - ext + 1, 1, ext); // top edge
+      gfx.fillRect(i, y + h - 1,   1, ext); // bottom edge
+    }
+    for (let j = y; j < y + h; j++) {
+      const n = notch[ni++ % notch.length];
+      const ext = (j % n === 0) ? 2 : 1;
+      gfx.fillRect(x - ext + 1, j, ext, 1); // left edge
+      gfx.fillRect(x + w - 1,   j, ext, 1); // right edge
+    }
+  }
+
   // ── _drawHUD ─────────────────────────────────────────────────────────────────
   _drawHUD() {
     this.hudGfx.clear();
@@ -1316,7 +1339,6 @@ class GameScene extends Phaser.Scene {
     this.timerText.setVisible(false);
 
     // ── Persistent HUD texts ─────────────────────────────────────────────────
-    this.yearText.setText(`Year: ${this.currentYear}`);
     const ghostSuffix = this.spiritGhostTimer > 0
       ? `  ✦ ${Math.ceil(this.spiritGhostTimer)}s` : '';
     this.treesSavedText.setText(`Trees Saved: ${this.score} / ${this.pointsToWin}${ghostSuffix}`);
@@ -1338,16 +1360,52 @@ class GameScene extends Phaser.Scene {
     this.hudGfx.lineStyle(1.5, 0xffffff, 0.5);
     this.hudGfx.strokeRect(hbX, hbY, hbW, hbH);
 
-    // ── Energy bar — top-right, below year text ───────────────────────────
+    // ── Energy bar — Ritual Bark style ────────────────────────────────────
     const SW = this.scale.width;
     const ebW = 120, ebH = 10, ebX = SW - 140, ebY = 60;
-    this.hudGfx.fillStyle(0x222222, 0.8);
+
+    // Glow behind bar
+    for (let i = 8; i > 0; i--) {
+      this.hudGfx.fillStyle(0x8cc83c, i * 0.012);
+      this.hudGfx.fillRect(ebX - i, ebY - i, ebW + i * 2, ebH + i * 2);
+    }
+    // Dark trough
+    this.hudGfx.fillStyle(0x0e1804, 1);
     this.hudGfx.fillRect(ebX, ebY, ebW, ebH);
-    const eColor = this.energy > 0.30 ? 0x44aaff : 0xff7722; // orange warning when low
-    this.hudGfx.fillStyle(eColor, 0.9);
-    this.hudGfx.fillRect(ebX, ebY, ebW * this.energy, ebH);
-    this.hudGfx.lineStyle(1.5, 0xffffff, 0.5);
-    this.hudGfx.strokeRect(ebX, ebY, ebW, ebH);
+    // Fill — green gradient approximated with two rects; orange warning when low
+    const fillW = ebW * this.energy;
+    if (this.energy > 0.30) {
+      this.hudGfx.fillStyle(0x3a7010, 1);
+      this.hudGfx.fillRect(ebX, ebY, fillW, ebH);
+      this.hudGfx.fillStyle(0xa8e040, 0.55);
+      this.hudGfx.fillRect(ebX, ebY, fillW, Math.ceil(ebH * 0.45));
+    } else {
+      this.hudGfx.fillStyle(0xff7722, 0.9);
+      this.hudGfx.fillRect(ebX, ebY, fillW, ebH);
+    }
+    // Shimmer line at top of fill
+    this.hudGfx.fillStyle(0xb4ff50, 0.4);
+    this.hudGfx.fillRect(ebX, ebY, fillW, 2);
+    // Bark border
+    this._barkBorder(this.hudGfx, ebX - 2, ebY - 2, ebW + 4, ebH + 4, 0x8a6830);
+    // Position 'SPIRIT ENERGY' label 10px above the bar
+    this.energyLabel.setPosition(ebX, ebY - 10);
+
+    // ── Year clock — Ritual Bark style ────────────────────────────────────
+    const yw = 88, yh = 28, yx = SW - yw - 16, yy = 14;
+    // Glow
+    for (let i = 8; i > 0; i--) {
+      this.hudGfx.fillStyle(0xb48c1e, i * 0.012);
+      this.hudGfx.fillRect(yx - i, yy - i, yw + i * 2, yh + i * 2);
+    }
+    // Background
+    this.hudGfx.fillStyle(0x110c04, 1);
+    this.hudGfx.fillRect(yx, yy, yw, yh);
+    // Bark border
+    this._barkBorder(this.hudGfx, yx - 2, yy - 2, yw + 4, yh + 4, 0x8a6830);
+    // Position 'YEAR' label and year numeral inside the box
+    this.yearText.setPosition(yx + yw / 2, yy + 5);
+    this.yearNumText.setPosition(yx + yw / 2, yy + yh - 4).setText(String(this.currentYear));
   }
 
   // ── _triggerLevelClear ───────────────────────────────────────────────────────
